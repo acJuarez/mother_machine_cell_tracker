@@ -696,11 +696,6 @@ def drift_correction_f4ds(hyperstacked_path):
                 # 2. Insert Z-axis (Z=1) to get C T Z Y X, as f4ds expects 5D data
                 hyperstacked_img = np.expand_dims(hyperstacked_img, axis=2)
 
-                # 3. Swap back to T C Z Y X (assuming your original code did this implicitly)
-                # Let's ensure the data is TCZYX for f4ds:
-                # This ensures T is the first axis (0) for drift calculation.
-                hyperstacked_img = hyperstacked_img.swapaxes(0, 1)  # Now: T C Z Y X
-
                 # Convert ref_channel to 0-based index
                 ref_channel = int(ref_channel) - 1
                 if ref_channel >= hyperstacked_img.shape[1]:
@@ -741,16 +736,13 @@ def drift_correction_f4ds(hyperstacked_path):
                     df = df.fillna(0)
                     df.to_csv("drifts.csv")
 
-                # FINAL STEP: Convert TCZYX back to TCYX
-
                 # 1. Drop the Z-axis (axis 2) which has a size of 1
-                final_array = tmp_data[:, :, 0, :, :]
-
+                final_array = np.squeeze(tmp_data, axis=2)  # Removes the Z=1 dimension
+                final_array = np.moveaxis(final_array, 1, 0)   # Move T (axis 1) to be first
                 # 2. Re-evaluate final shape (should be TCYX)
                 print(f"Output shape (TCYX): {final_array.shape}")
 
                 img_cor_file = Path(output_dir_path) / f"drift_cor_{experiment}_xy{position}.tif"
-
                 # tifffile.imwrite writes the final_array (T C Y X)
                 # Note: OME metadata is optional but usually good practice.
                 tifffile.imwrite(img_cor_file, final_array, ome=True)
