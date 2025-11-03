@@ -668,7 +668,6 @@ def drift_correction_f4ds(hyperstacked_path):
     output_dir_path = os.path.join(hyperstacked_path, 'drift_corrected')
     os.makedirs(output_dir_path, exist_ok=True)
 
-    ref_channel = 1  # Using integer 1 directly
     correct_xy = True
     correct_z = False  # Keep this False since we want TCYX
     correct_center_rotation = False
@@ -678,6 +677,8 @@ def drift_correction_f4ds(hyperstacked_path):
     for filename in os.listdir(hyperstacked_path):
         if filename.endswith('.tif') or filename.endswith('.tiff'):
             if re.match(r'(.*)_xy(\d+)\.', filename):
+                # Using integer 1 directly
+                ref_channel = 1
                 match = re.match(r'(.*)_xy(\d+)\.', filename)
                 experiment, position = match.groups()
                 img_path = os.path.join(hyperstacked_path, filename)
