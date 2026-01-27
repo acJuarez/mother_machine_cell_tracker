@@ -19,6 +19,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 import multiprocessing
 import dask.array as da
+import json
+
 
 
 def subtract_fov_stack(path_to_mm_channels, FOV, empty_stack_id, ana_peak_ids, method = 'phase', channel_index = 0):
@@ -566,7 +568,7 @@ def detect_clear_image(image):
         return True
 
 
-def drift_correct(root_dir, experiment_name, fast4, c=0):
+def drift_correct(root_dir, experiment_name, fast4, pos_list, c=0):
 	"""
 	Arg
 	root_dir: parent directory containing multiple 'Pos#' directories,
@@ -579,8 +581,20 @@ def drift_correct(root_dir, experiment_name, fast4, c=0):
 	09/09/25: Added boolean arg fast4. if set to true will run drift correctio using fast4Dreg drift corerection, if set to false 
 	Napari drift correction will be used
 	"""
+	if pos_list:
+		try:
+			positions = json.loads(pos_list)
+			for i in range(len(positions)):
+				pos = positions[i]
+				newpos = f"{root_dir}/{pos}"
+				positions[i] = newpos
+		except json.JSONDecodeError:
+			print("ERROR: Could not parse the position list. Ensure it is valid JSON or that its not empty")
+			return
+	else:
+		positions = False			
 
-	hyperstacked_path, time_dict = hyperstack_tif_tcyx(root_dir, experiment_name, c)
+	hyperstacked_path, time_dict = hyperstack_tif_tcyx(root_dir, experiment_name, positions, c)
 	if fast4 == True:
 		drift_corrected_path = drift_correction_f4ds(hyperstacked_path)
 	else: 
@@ -590,7 +604,7 @@ def drift_correct(root_dir, experiment_name, fast4, c=0):
 	return drift_corrected_path
 
 
-def hyperstack_tif_tcyx(root_dir, experiment_name, c=0):
+def hyperstack_tif_tcyx(root_dir, experiment_name, pos_list, c=0):
 	"""Renames TIFF files without deleting originals.
 	Args:
 	input_dir: parent directory.
@@ -598,6 +612,9 @@ def hyperstack_tif_tcyx(root_dir, experiment_name, c=0):
 	"""
 	root = Path(root_dir)
 	input_dirs = [str(path) for path in root.glob('**//Pos*') if path.is_dir()]
+
+	if pos_list:
+		input_dirs = [pos for pos in input_dirs if pos in pos_list]
 
 	# Create output directory if it doesn't exist
 	# for now don't save renamed files because they take up too much space
