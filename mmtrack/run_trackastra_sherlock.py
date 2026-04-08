@@ -52,33 +52,18 @@ def plot_trackastra_kymograph(imgs, ctc_masks, napari_tracks, napari_tracks_grap
 ])
 
 def run_track_astra():
-    path_all_lineages_df = '/Users/adrianjuarez/Documents/Covert_lab/Projects/Operon/tracked_all_cell_data_aggregate_032626.pkl'
-    path_all_cell_data_df = '/Users/adrianjuarez/Documents/Covert_lab/Projects/Operon/all_cell_data_aggregate_032626.pkl'
-    all_lineages_df = pd.read_pickle(path_all_lineages_df)
-    all_cell_data_df = pd.read_pickle(path_all_cell_data_df)
+    base_path =f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test'
 
-    experiment = 'DUMM_gitg068_baeS_100225'
-    base_path =f'/Volumes/mcovert/Instruments/Covert-lab-scope1/subgen_processed_data/{experiment}/hyperstacked/drift_corrected/rotated/mm_channels/subtracted'
-    path_to_phase_stack_dir=f'{base_path}'
-    path_to_labels_stack_dir =f'{base_path}/mask_kymos'
-    phase_list = os.listdir(path_to_phase_stack_dir)
-    mask_list =os.listdir(path_to_labels_stack_dir)
+    time_dict ='{"DUMM_gitg068_baeS_100225":{"018":{"1185":{"start": 65, "end": 85},"1260":{"start": 10, "end": 30}}},"DUMM_giTG060_064_121425":{"000":{"1343":{"start": 20, "end": 40}}}}'
+    time_range_dict = json.loads(time_dict)
+    # print(len(time_range_dict))
+    phase_c_str = '0'
+    fluor_c_str = '1'
+	
+    device = "automatic" 
+    model = Trackastra.from_pretrained("general_2d_w_SAM2_features", device=device)
+	
 
-    path_to_mask = f'{base_path}/mm3_segmented_subtracted_FOV_018_region_1185_c_0.tif'
-    path_to_phase = f'{base_path}/subtracted_FOV_018_region_1185_c_0.tif'
-    imgs=tifffile.imread(path_to_phase)
-    masks=tifffile.imread(path_to_mask)
-    
-
-    with open("napari_tracks_graph.json") as f:
-        napari_tracks_graph = json.load(f)
-        napari_tracks_graph = {int(k): int(v) for k, v in napari_tracks_graph.items()}
-    napari_tracks = np.load("napari_tracks.npy")
-    ctc_masks = np.load("ctc_masks.npy")
-    v = napari.Viewer()
-    v.add_image(imgs)
-    v.add_labels(ctc_masks)
-    v.add_tracks(data=napari_tracks, graph=napari_tracks_graph)
 
 if __name__ == "__main__":
     run_track_astra()
