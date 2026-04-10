@@ -15,7 +15,9 @@ def segment_chnl_stack(path_to_phase_channel_stack,
 					   second_opening_size=1,
 					   min_cell_area=200,
 					   max_cell_area=700,
-					   small_merge_area_threshold=50):
+					   small_merge_area_threshold=50,
+					   first_opening_morph=None,
+					   second_opening_morph=None):
 	"""
 	For a given fov and peak (channel), do segmentation for all images in the
 	subtracted .tif stack.
@@ -40,7 +42,9 @@ def segment_chnl_stack(path_to_phase_channel_stack,
 											second_opening_size,
 											min_cell_area,
 											max_cell_area,
-											small_merge_area_threshold)
+											small_merge_area_threshold,
+											first_opening_morph,
+											second_opening_morph)
 
 		unstacked_seg_image = unstacked_seg_image.astype("uint8")
 		unstacked_seg_filename = f'mask_t_{time:03d}_{filename}'
@@ -66,7 +70,9 @@ def segment_image(image,
 				  min_cell_area=200,
 				  max_cell_area=700,
 				  small_merge_area_threshold=50,
-				  min_axis_ratio=0.04):
+				  min_axis_ratio=0.04,
+				  first_opening_morph=None,
+				  second_opening_morph=None):
 	"""Segments an image with size and shape filtering, and improved structure."""
 	
 	scale = np.median(image) / np.mean(image)
@@ -82,12 +88,15 @@ def segment_image(image,
 			warnings.simplefilter("ignore")
 			thresh = filters.threshold_otsu(image)
 		thresholded = image > OTSU_threshold * thresh
-		# morph = morphology.binary_opening(thresholded, morphology.disk(first_opening))
-
-		# if diagnol opening use the following code
-		diagonal_footprint = np.zeros((first_opening, first_opening))
-		np.fill_diagonal(diagonal_footprint, 1)
-		morph = morphology.binary_opening(thresholded, diagonal_footprint)
+		
+		if first_opening_morph == 1:
+			# Use diagonal opening
+			diagonal_footprint = np.zeros((first_opening, first_opening))
+			np.fill_diagonal(diagonal_footprint, 1)
+			morph = morphology.binary_opening(thresholded, diagonal_footprint)
+		else:
+			# Use disk opening (default when first_opening_morph is 0 or None)
+			morph = morphology.binary_opening(thresholded, morphology.disk(first_opening))
 
 		if np.amax(morph) == 0:
 			return np.zeros_like(image)
@@ -96,13 +105,15 @@ def segment_image(image,
 		distance_thresh = distance >= distance_threshold
 
 		#if using spherical opening
-		distance_opened = morphology.binary_opening(distance_thresh, morphology.disk(second_opening_size))
-
-		# if using diagonal foorprint
-		# diagonal_footprint_two = np.zeros((second_opening_size, second_opening_size))
-		# np.fill_diagonal(diagonal_footprint_two, 1)
-		# distance_opened = morphology.binary_opening(distance_thresh, diagonal_footprint_two)
-
+		if second_opening_morph == 1:
+			# Use diagonal opening
+			diagonal_footprint_two = np.zeros((second_opening_size, second_opening_size))
+			np.fill_diagonal(diagonal_footprint_two, 1)
+			distance_opened = morphology.binary_opening(distance_thresh, diagonal_footprint_two)
+		else:
+			# Use disk opening (default when second_opening_morph is 0 or None)
+			distance_opened = morphology.binary_opening(distance_thresh, morphology.disk(second_opening_size))
+			
 		labeled, num_labels = morphology.label(distance_opened, connectivity=1, return_num=True)
 		if num_labels == 0:
 			return np.zeros_like(image)
