@@ -70,7 +70,6 @@ def segment_image(image,
 				  min_cell_area=200,
 				  max_cell_area=700,
 				  small_merge_area_threshold=50,
-				  min_axis_ratio=0.04,
 				  first_opening_morph=None,
 				  second_opening_morph=None):
 	"""Segments an image with size and shape filtering, and improved structure."""
@@ -166,6 +165,8 @@ def segment_image(image,
 	# 4. Shape Filtering (Axis Ratio)
 	filtered_labeled_image = np.zeros_like(labeled_image)
 	regions = measure.regionprops(labeled_image)
+	min_axis_ratio = 0.04
+
 
 	for region in regions:
 		if region.axis_major_length > 0:
