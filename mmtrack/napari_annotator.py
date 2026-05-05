@@ -1,0 +1,88 @@
+import os
+
+import numpy as np
+import tifffile
+import napari
+from matplotlib import colormaps
+from napari.utils.colormaps import label_colormap
+
+
+
+def stack_to_kymograph(stack):
+    """
+    takes a numpyarray of an image in the format (t, y, x) and converts it into a kymograph
+    """
+
+    kymograph_gray = []
+    for i in range(stack.shape[0]):
+        frame = stack[i]
+        if frame.ndim == 3:
+            kymograph_gray.append(frame, axis=2)
+        else:
+            kymograph_gray.append(frame)
+    
+    kymograph = np.concatenate(kymograph_gray, axis =1)
+    return kymograph
+
+def kymograph_to_stack(kymograph, stack):
+    """
+    reversees stack_to_kymograph
+    to ensure dimensions remain the same an input is the original stack in format (t,y,x) 
+    """
+    t = stack.shape[0]  # number of time frames
+    y = stack.shape[1]  # height
+    x = stack.shape[2]  # width of each frame
+    
+    # Split the kymograph back into individual frames
+    reconstructed_stack = []
+    for i in range(t):
+        start_col = i * x
+        end_col = (i + 1) * x
+        frame = kymograph[:, start_col:end_col]  # shape: (y, x)
+        reconstructed_stack.append(frame)
+    
+    return np.array(reconstructed_stack)
+
+def run_annotator(phase_path, mask_path, FOV, peak_id):
+    """
+    this function sets up napari to edit labels from mmmct pipeline
+
+    Args:
+        phase_path: Path to the phase image stack (T,Y,X TIFF).
+        mask_path:  Path to the auto-generated mask stack (T,Y,X TIFF).
+
+    Returns:
+        Path to the saved corrected mask file.
+    """
+
+    phase_stack = tifffile.imread(phase_path)
+    mask_stack = tifffile.imread(mask_path)
+
+
+    viewer = napari.Viewer()
+    viewer.add_image(stack_to_kymograph(phase_stack), name="phase", colormap="gray")
+    num_colors = 20
+    tab20_colors = label_colormap(num_colors, seed=0.5)
+    
+    label_layer = viewer.add_labels(
+        stack_to_kymograph(mask_stack).astype("uint32"), 
+        name="segmentation",
+        colormap=tab20_colors
+    )
+
+    print("    -> napari open. Edit labels, then close the window to save.")
+    napari.run()
+
+    corrected_kymograph = label_layer.data
+    corrected = kymograph_to_stack(corrected_kymograph, mask_stack)
+    
+    
+
+    corrections_dir = os.path.join(os.path.dirname(phase_path), "napari_corrections")
+    os.makedirs(corrections_dir, exist_ok=True)
+
+    output_path = os.path.join(corrections_dir, f'{FOV}_{peak_id}_corrected.tif')
+    tifffile.imwrite(output_path, corrected.astype(mask_stack.dtype))
+    print(f"    -> Corrected masks saved to: {output_path}")
+
+    return output_path
