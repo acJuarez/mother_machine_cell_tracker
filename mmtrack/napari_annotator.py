@@ -43,6 +43,30 @@ def kymograph_to_stack(kymograph, stack):
     
     return np.array(reconstructed_stack)
 
+def _add_frame_labels(viewer, phase_stack):
+    """Overlay frame-number text at the top of each frame column in the kymograph."""
+    num_frames = phase_stack.shape[0]
+    frame_width = phase_stack.shape[2]
+
+    coords = np.array(
+        [[5.0, i * frame_width + frame_width / 2.0] for i in range(num_frames)]
+    )
+    text = {
+        "string": [str(i) for i in range(num_frames)],
+        "size": 5,
+        "color": "white",
+        "anchor": "center",
+    }
+    viewer.add_points(
+        coords,
+        text=text,
+        size=1,
+        face_color="transparent",
+        border_color="transparent",
+        name="frame_numbers",
+    )
+
+
 def run_annotator(phase_path, mask_path, FOV, peak_id):
     """
     this function sets up napari to edit labels from mmmct pipeline
@@ -63,12 +87,14 @@ def run_annotator(phase_path, mask_path, FOV, peak_id):
     viewer.add_image(stack_to_kymograph(phase_stack), name="phase", colormap="gray")
     num_colors = 20
     tab20_colors = label_colormap(num_colors, seed=0.5)
-    
+
     label_layer = viewer.add_labels(
-        stack_to_kymograph(mask_stack).astype("uint32"), 
+        stack_to_kymograph(mask_stack).astype("uint32"),
         name="segmentation",
         colormap=tab20_colors
     )
+
+    _add_frame_labels(viewer, phase_stack)
 
     print("    -> napari open. Edit labels, then close the window to save.")
     napari.run()
