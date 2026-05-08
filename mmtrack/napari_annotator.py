@@ -29,16 +29,15 @@ def kymograph_to_stack(kymograph, stack):
     reversees stack_to_kymograph
     to ensure dimensions remain the same an input is the original stack in format (t,y,x) 
     """
-    t = stack.shape[0]  # number of time frames
-    y = stack.shape[1]  # height
-    x = stack.shape[2]  # width of each frame
+    t = stack.shape[0]  
+    y = stack.shape[1]  
+    x = stack.shape[2]  
     
-    # Split the kymograph back into individual frames
     reconstructed_stack = []
     for i in range(t):
         start_col = i * x
         end_col = (i + 1) * x
-        frame = kymograph[:, start_col:end_col]  # shape: (y, x)
+        frame = kymograph[:, start_col:end_col]  
         reconstructed_stack.append(frame)
     
     return np.array(reconstructed_stack)
@@ -53,7 +52,7 @@ def _add_frame_labels(viewer, phase_stack):
     )
     text = {
         "string": [str(i) for i in range(num_frames)],
-        "size": 5,
+        "size": 7,
         "color": "white",
         "anchor": "center",
     }
@@ -72,8 +71,8 @@ def run_annotator(phase_path, mask_path, FOV, peak_id):
     this function sets up napari to edit labels from mmmct pipeline
 
     Args:
-        phase_path: Path to the phase image stack (T,Y,X TIFF).
-        mask_path:  Path to the auto-generated mask stack (T,Y,X TIFF).
+        phase_path: Path to the phase image stack (T,Y,X).
+        mask_path:  Path to the auto-generated mask stack (T,Y,X).
 
     Returns:
         Path to the saved corrected mask file.
@@ -96,19 +95,22 @@ def run_annotator(phase_path, mask_path, FOV, peak_id):
 
     _add_frame_labels(viewer, phase_stack)
 
-    print("    -> napari open. Edit labels, then close the window to save.")
+    print("    ---napari open. Edit labels, then close the window to save.")
     napari.run()
 
     corrected_kymograph = label_layer.data
     corrected = kymograph_to_stack(corrected_kymograph, mask_stack)
-    
-    
 
     corrections_dir = os.path.join(os.path.dirname(phase_path), "napari_corrections")
     os.makedirs(corrections_dir, exist_ok=True)
 
     output_path = os.path.join(corrections_dir, f'{FOV}_{peak_id}_corrected.tif')
+    if os.path.exists(output_path):
+        response = input(f"    ---File already exists: {output_path}\n    --- Overwrite? [y/N]: ").strip().lower()
+        if response != 'y':
+            print("    ---Save cancelled.")
+            return output_path
     tifffile.imwrite(output_path, corrected.astype(mask_stack.dtype))
-    print(f"    -> Corrected masks saved to: {output_path}")
+    print(f"    ---Corrected masks saved to: {output_path}")
 
     return output_path
