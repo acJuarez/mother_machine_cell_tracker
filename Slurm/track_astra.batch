@@ -1,0 +1,20 @@
+#!/bin/bash
+#SBATCH --job-name=trackastra_test
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --time=04:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=aj0204@stanford.edu
+
+# Arguments passed from the submission script via: sbatch track_astra.batch <base_path> '<json>'
+#   $1 = base path to experiments directory
+#   $2 = JSON time-range-dict for a single (exp, FOV, peak_id) combination
+BASE_PATH=$1
+TIME_RANGE_DICT=$2
+
+apptainer exec /home/users/aj0204/Docker/trackastra_v2.sif \
+    python /home/users/aj0204/repos/mother_machine_cell_tracker/mmtrack/run_trackastra_sherlock.py \
+    --base-path "$BASE_PATH" \
+    --time-range-dict "$TIME_RANGE_DICT"
