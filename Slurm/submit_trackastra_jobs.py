@@ -1,24 +1,22 @@
-"""
-Submit one sbatch job per (experiment, FOV, peak_id) combination.
-
-Usage:
-    python Slurm/submit_trackastra_jobs.py \
-        --base-path /oak/stanford/groups/mcovert/... \
-        --time-dict '{"Exp_name":{"000":{"1343":{"start":62,"end":null}}}}' \
-        [--batch-script Slurm/track_astra.batch] \
-        [--dry-run]
-
-With --dry-run the sbatch commands are printed but not executed.
-"""
-
 import argparse
 import json
 import subprocess
 import sys
 from pathlib import Path
 
+"""
+Submit one sbatch job per (experiment, FOV, peak_id) combination to run track_astra in parallel 
+should help save time
 
-def submit_jobs(base_path: str, time_dict_str: str, batch_script: str, dry_run: bool) -> None:
+args are as follows: 
+    --base-path path where experiments are located  \ 
+    --time-dict JSON string in the following format'{"Exp_name":{"000":{"1343":{"start":62,"end":null}}}}' \
+    [--batch-script Slurm/track_astra.batch] \
+
+With --dry-run the sbatch commands are printed but not executed.
+"""
+
+def submit_jobs(base_path: str, time_dict_str: str, batch_script: str) -> None:
     time_dict = json.loads(time_dict_str)
 
     jobs = []
@@ -27,7 +25,7 @@ def submit_jobs(base_path: str, time_dict_str: str, batch_script: str, dry_run: 
             for peak_id, time_info in peak_dict.items():
                 jobs.append((exp_name, fov_id, peak_id, time_info))
 
-    print(f"Found {len(jobs)} job(s) to submit.\n")
+    print(f"submitting {len(jobs)} job(s).\n")
 
     for exp_name, fov_id, peak_id, time_info in jobs:
         # Build a single-entry JSON so each job only processes one trench
@@ -44,19 +42,14 @@ def submit_jobs(base_path: str, time_dict_str: str, batch_script: str, dry_run: 
             single_json,
         ]
 
-        print(f"Job: {job_name}")
-        print(f"  time_range: {time_info}")
-        print(f"  command:    {' '.join(cmd)}\n")
-
-        if not dry_run:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                print(f"  -> {result.stdout.strip()}")
-            else:
-                print(f"  ERROR: {result.stderr.strip()}", file=sys.stderr)
-
-    if dry_run:
-        print("Dry run complete — no jobs submitted.")
+        print(f"experiment: {job_name}")
+        print(f" time_range: {time_info}")
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"-- {result.stdout.strip()}")
+        else:
+            print(f"ERROR: {result.stderr.strip()}", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -78,11 +71,6 @@ if __name__ == "__main__":
         default="Slurm/track_astra.batch",
         help="Path to the SLURM batch script (default: Slurm/track_astra.batch)",
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print sbatch commands without actually submitting",
-    )
+    
     args = parser.parse_args()
-
-    submit_jobs(args.base_path, args.time_dict, args.batch_script, args.dry_run)
+    submit_jobs(args.base_path, args.time_dict, args.batch_script)
