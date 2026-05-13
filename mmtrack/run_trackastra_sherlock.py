@@ -8,7 +8,7 @@ from trackastra.data import example_data_bacteria
 import tifffile
 import napari
 import json
-import pandas as np
+import pandas as pd
 import numpy as np
 import argparse
 
@@ -19,17 +19,12 @@ def get_tiff_frame_count(file_path):
     NOTE: This loads the entire file into memory.
     """
     try:
-        # Load the entire image stack into memory
         img_stack = tifffile.imread(file_path)
-
         shape = img_stack.shape
 
-        # Assume the time axis (T) is the first dimension
         if len(shape) >= 3:
-            # The last index is T - 1
             return shape[0] - 1
         else:
-            # Single 2D image
             return 0
 
     except FileNotFoundError:
@@ -38,22 +33,24 @@ def get_tiff_frame_count(file_path):
     except Exception as e:
         print(f"Error reading TIFF file {file_path}: {e}")
         return 0
+    
+def stack_to_kymograph(stack):
+    """
+    takes a numpyarray of an image in the format (t, y, x) and converts it into a kymograph
+    """
 
-def plot_trackastra_kymograph(imgs, ctc_masks, napari_tracks, napari_tracks_graph):
-    kymo_imgs = imgs.transpose(1, 0, 2).reshape(382, -1)  # (382, 1800)
-    kymo_masks = ctc_masks.transpose(1, 0, 2).reshape(382, -1)
-
-    kymo_tracks = napari_tracks.copy()
-    new_x = napari_tracks[:, 1] * 20 + napari_tracks[:, 3]
-    kymo_tracks = np.column_stack([
-        napari_tracks[:, 0],  # track_id
-        np.zeros(len(napari_tracks)),  # dummy time (all in same frame)
-        napari_tracks[:, 2],  # y stays the same
-        new_x  # new x position
-    ])
+    kymograph_gray = []
+    for i in range(stack.shape[0]):
+        frame = stack[i]
+        if frame.ndim == 3:
+            kymograph_gray.append(frame, axis=2)
+        else:
+            kymograph_gray.append(frame)
+    
+    kymograph = np.concatenate(kymograph_gray, axis =1)
+    return kymograph
 
 def run_track_astra(base_path, time_range_dict):
-    # time_dict ='{"DUMM_giTG060_064_121425":{"000":{"1343":{"start": 62, "end": null}}}}'
     time_range_dict = json.loads(time_range_dict)
     print(len(time_range_dict))
     
@@ -83,7 +80,6 @@ def run_track_astra(base_path, time_range_dict):
             
                 
                 if end is None:
-                    # Calculate end frame dynamically using the Phase stack file
                     end = get_tiff_frame_count(path_to_phase_stack)
                     if end == 0:
                         print(f"    WARNING: Could not determine frame count for {peak_id}. Skipping.")
@@ -97,10 +93,7 @@ def run_track_astra(base_path, time_range_dict):
                 except FileNotFoundError as e:
                     print(f"    WARNING: Required file not found for {peak_id}: {e}. Skipping.")
                     continue
-                # here is where I need to incorporate start and end
-                print(peak_id)
-                print(start)
-                print(end) 
+                print(f"{peak_id} start: {start} end: {end}")
                 stack_phase_trimmed = stack_phase[start:end, :, :].copy()
                 stack_labeled_trimmed = stack_labeled[start:end, :, :].copy()   
                 track_graph, masks_tracked = model.track(stack_phase_trimmed, stack_labeled_trimmed, mode="ilp")
@@ -108,11 +101,12 @@ def run_track_astra(base_path, time_range_dict):
                     track_graph, masks_tracked, outdir=f'test_040726')
                 
                 napari_tracks, napari_tracks_graph, _ = graph_to_napari_tracks(track_graph)
-    
+
+                #save outputs to be plotted elsewhere
+                ctc_tracks.to_csv("/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_ctc_tracks_{fov_id}_{peak_id}.csv")
                 np.save(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_ctc_masks_{fov_id}_{peak_id}.npy', ctc_masks)
                 np.save(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_imgs_{fov_id}_{peak_id}.npy', stack_phase_trimmed)
                 np.save(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_napari_tracks_{fov_id}_{peak_id}.npy', napari_tracks)
-    
                 with open(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_napari_tracks_graph_{fov_id}_{peak_id}.json', "w") as f:
                     json.dump(napari_tracks_graph, f)
 
@@ -123,21 +117,21 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        'base-path',
+        '--base-path',
         required=True,
         type=str,
         help="path to directory containing all microscopy experiments"
     )
 
     parser.add_argument(
-        'time-range-dict',
+        '--time-range-dict',
         required=False,
         type=str,
         default='',
-        help='JSON string defining start/end time frames to trip image before applying trackastra. Format is: '
+        help='JSON string defining start/end time frames to trim image before applying trackastra. Format: '
              '{"Exp_name":{"FOV":{"Peak_ID":{"start": 62, "end": null}}}}'
     )
-    
+
     args = parser.parse_args()
-    
+
     run_track_astra(args.base_path, args.time_range_dict)
