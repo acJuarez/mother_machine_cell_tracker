@@ -71,7 +71,7 @@ def run_track_astra(base_path, time_range_dict):
                 path_to_phase_stack = os.path.join(base_file_path,
                                                     f'subtracted_FOV_{fov_id}_region_{peak_id}_c_{phase_c_str}.tif')
                 path_to_labeled_stack = os.path.join(base_file_path,
-                                                        f'mm3_segmented_subtracted_FOV_{fov_id}_region_{peak_id}_c_{phase_c_str}.tif')
+                                                        f'napari_corrections/{fov_id}_{peak_id}_corrected.tif')
                 path_to_fluor_stack = os.path.join(base_file_path,
                                                     f'subtracted_FOV_{fov_id}_region_{peak_id}_c_{fluor_c_str}.tif')
                 # --- Dynamic Time Range Assignment ---
@@ -103,7 +103,7 @@ def run_track_astra(base_path, time_range_dict):
                 napari_tracks, napari_tracks_graph, _ = graph_to_napari_tracks(track_graph)
 
                 #save outputs to be plotted elsewhere
-                ctc_tracks.to_csv("/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_ctc_tracks_{fov_id}_{peak_id}.csv")
+                ctc_tracks.to_csv(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_ctc_tracks_{fov_id}_{peak_id}.csv')
                 np.save(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_ctc_masks_{fov_id}_{peak_id}.npy', ctc_masks)
                 np.save(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_imgs_{fov_id}_{peak_id}.npy', stack_phase_trimmed)
                 np.save(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_napari_tracks_{fov_id}_{peak_id}.npy', napari_tracks)
