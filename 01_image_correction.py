@@ -13,20 +13,19 @@ def run_image_correction(input_dir, phase_channel_idx,
 
 	# 1. DRIFT CORRECTION
 	print("\n--- 1. Performing Drift Correction ---")
-	drift_corrected_path = pre_process_mm.drift_correct(
+	drift_corrected_path = pre_process_mm.drift_correct_padded(
 		root_dir=input_dir,
 		experiment_name='DuMM',
-		fast4=fast_drift_correction,
-		pos_list = pos_list,
-		c=phase_channel_idx  # Phase channel index
+		pos_list=pos_list,
+		c=phase_channel_idx
 	)
 	print(f"Drift correction complete. Files path: {drift_corrected_path}")
 
 	# 2. IMAGE ROTATION
 	print("\n--- 2. Performing Image Rotation ---")
-	path_to_rotated_images = pre_process_mm.rotate_stack(
+	path_to_rotated_images = pre_process_mm.rotate_stack_padded(
 		drift_corrected_path,
-		c=phase_channel_idx,  # Phase channel index
+		c=phase_channel_idx,
 		growth_channel_length=growth_len,
 		closed_ends=trench_ends_orientation
 	)

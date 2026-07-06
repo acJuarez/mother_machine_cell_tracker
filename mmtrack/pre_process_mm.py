@@ -566,6 +566,77 @@ def rotate_stack(path_to_stack, c=0, growth_channel_length=400, closed_ends = 'd
 	print('Successfully rotated stack')
 	return path_to_rotated_images
 
+def rotate_stack_padded(path_to_stack, c=0, growth_channel_length=400, closed_ends='down'):
+    """Like rotate_stack but pre-pads the image in x (and y) before rotating so
+    that content near the horizontal edges is not clipped by cv2.warpAffine's
+    fixed output canvas. The y-crop to the growth channel is applied afterwards
+    as usual."""
+
+    current_script_dir = os.path.dirname(os.path.abspath(__file__))
+    font_path = os.path.join(current_script_dir, '..', 'fonts', 'Roboto-Regular.ttf')
+    font = ImageFont.truetype(font_path, 15)
+
+    path_to_rotated_images = os.path.join(path_to_stack, 'rotated')
+    os.makedirs(path_to_rotated_images, exist_ok=True)
+
+    file_groups = org_by_timepoint([path_to_stack])
+
+    for position in file_groups.keys():
+        file_path = file_groups[position]['hyperstacked']['stacked']
+        filename = os.path.basename(file_path)
+        stacked_img = tifffile.imread(file_path)
+        ref_phase_img = stacked_img[0, c, :, :]
+
+        h, w = ref_phase_img.shape
+        horizontal_lines, vertical_lines = id_lines(ref_phase_img)
+        plot_lines(ref_phase_img, horizontal_lines)
+
+        rotation_angle = calculate_rotation_angle(horizontal_lines)
+
+        # Amount of x content lost by cv2.warpAffine with a fixed canvas is
+        # approximately h*sin(θ) total; padding each side by that amount ensures
+        # nothing is clipped.
+        angle_rad = np.abs(np.deg2rad(rotation_angle))
+        x_pad = int(np.ceil(h * np.sin(angle_rad)))
+        y_pad = int(np.ceil(w * np.sin(angle_rad)))
+        print(f"Rotation {rotation_angle:.2f}°: padding x by {x_pad}px per side, y by {y_pad}px per side")
+
+        # stacked_img is TCYX; pad axes 2 (Y) and 3 (X)
+        pad_width = [(0, 0), (0, 0), (y_pad, y_pad), (x_pad, x_pad)]
+        stacked_img_padded = np.pad(stacked_img, pad_width, mode='constant', constant_values=0)
+        ref_phase_img_padded = stacked_img_padded[0, c, :, :]
+        h_padded, w_padded = ref_phase_img_padded.shape
+
+        ref_rotated_image = apply_image_rotation(ref_phase_img_padded, rotation_angle, closed_ends)
+        rot_horizontal_lines, rot_vertical_lines = id_lines(ref_rotated_image)
+
+        crop_result = crop_around_central_flow(
+            rot_horizontal_lines, w_padded, h_padded, growth_channel_length, 1600
+        )
+        if crop_result is None:
+            print(f"Warning: no crop boundaries found for position {position}, skipping.")
+            continue
+        crop_start, crop_end = crop_result
+
+        rotated_stack = apply_image_rotation(stacked_img_padded, rotation_angle, closed_ends)
+        cropped_stack = rotated_stack[:, :, crop_start:crop_end, :]
+
+        rgb_img = color.gray2rgb(cropped_stack[0, c, :, :], channel_axis=-1)
+        scaling_factor = 255 / (np.max(rgb_img) - np.min(rgb_img))
+        scaled_img = (rgb_img - np.min(rgb_img)) * scaling_factor
+        scaled_img = scaled_img.astype(np.uint8)
+        pil_image = Image.fromarray(scaled_img)
+        draw = ImageDraw.Draw(pil_image)
+        draw.text((0, 0), text=position, font=font, fill='red')
+
+        new_filename = f'rotated_{filename}'
+        new_path = os.path.join(path_to_rotated_images, new_filename)
+        tifffile.imwrite(new_path, cropped_stack)
+
+    print('Successfully rotated stack (padded)')
+    return path_to_rotated_images
+
+
 def detect_clear_image(image):
     laplacian_image = filters.laplace(image)
     blur_score = np.var(laplacian_image)
@@ -647,8 +718,11 @@ def hyperstack_tif_tcyx(root_dir, experiment_name, pos_list, c=0):
 					channel_image = tifffile.imread(image_path)
 					image_data.append(channel_image)
 
-				except OSError as e:
-					print(f'Error copying file: {e}')
+				except (OSError, tifffile.TiffFileError) as e:
+					print(f'Warning: skipping unreadable file {image_path}: {e}')
+			if not image_data:
+				print(f'Warning: no valid images for position {position} time {time}, skipping.')
+				continue
 			stacked_image = np.stack(image_data, axis=0)  # Assuming channels are the first dimension
 			phase_image = stacked_image[c, :, :]
 			if detect_clear_image(phase_image):  # only time stack clear images
@@ -771,6 +845,144 @@ def drift_correction_f4ds(hyperstacked_path):
                 tifffile.imwrite(img_cor_file, final_array, ome=True)
 
     return output_dir_path
+
+def drift_correction_f4ds_padded(hyperstacked_path):
+    """Drift-corrects TCYX stacks while preserving content at the image edges.
+
+    f4ds.crop_data crops to the region valid in EVERY frame (the intersection).
+    If the stage drifted 80px rightward over the movie, that removes 80px from
+    one side permanently — no amount of padding changes this, because it is a
+    property of which frames overlap, not of canvas size.
+
+    This function instead:
+      1. Pads the canvas so no content falls off-canvas when frames are shifted.
+      2. Applies the drift correction (aligning all frames to frame 0).
+      3. Skips crop_data and instead trims only the columns guaranteed to be
+         black in every frame (the outermost padding that no drift can reach).
+
+    The result is wider than f4ds.crop_data by approximately the drift range.
+    Edge columns will be black in the frames where the stage hadn't yet drifted
+    to that position, but the content is preserved for the frames where it was.
+    """
+    output_dir_path = os.path.join(hyperstacked_path, 'drift_corrected')
+    os.makedirs(output_dir_path, exist_ok=True)
+
+    correct_xy = True
+    correct_center_rotation = False
+    export_csv = False
+
+    for filename in os.listdir(hyperstacked_path):
+        if filename.endswith('.tif') or filename.endswith('.tiff'):
+            if re.match(r'(.*)_xy(\d+)\.', filename):
+                ref_channel = 1
+                match = re.match(r'(.*)_xy(\d+)\.', filename)
+                experiment, position = match.groups()
+                img_path = os.path.join(hyperstacked_path, filename)
+                hyperstacked_img = tifffile.imread(img_path)
+
+                initial_shape = hyperstacked_img.shape
+                print(f"Input shape (assumed TCYX): {initial_shape}")
+
+                hyperstacked_img = hyperstacked_img.swapaxes(0, 1)
+                hyperstacked_img = np.expand_dims(hyperstacked_img, axis=2)
+
+                ref_channel = int(ref_channel) - 1
+                if ref_channel >= hyperstacked_img.shape[1]:
+                    ref_channel = hyperstacked_img.shape[1] - 1
+
+                data = da.asarray(hyperstacked_img)
+                data = data.rechunk('auto')
+
+                tmp_data = data
+                xy_drift = np.asarray([[0, 0]])
+
+                if correct_xy:
+                    xy_drift = f4ds.get_xy_drift(data, ref_channel)
+
+                    # Pad by 2× max absolute drift so that when f4ds shifts a
+                    # frame, its content stays on the canvas rather than falling
+                    # off the edge and disappearing.
+                    x_pad = int(np.ceil(2 * np.max(np.abs(xy_drift[:, 0]))))
+                    y_pad = int(np.ceil(2 * np.max(np.abs(xy_drift[:, 1]))))
+                    print(f"X drift range [{xy_drift[:, 0].min():.1f}, {xy_drift[:, 0].max():.1f}], padding x by {x_pad}px per side")
+                    print(f"Y drift range [{xy_drift[:, 1].min():.1f}, {xy_drift[:, 1].max():.1f}], padding y by {y_pad}px per side")
+
+                    # data is CTZYX; pad axes 3 (Y) and 4 (X)
+                    pad_width = [(0, 0), (0, 0), (0, 0), (y_pad, y_pad), (x_pad, x_pad)]
+                    data_padded = da.pad(data, pad_width, mode='constant', constant_values=0)
+                    data_padded = data_padded.rechunk('auto')
+
+                    tmp_data = f4ds.apply_xy_drift(data_padded, xy_drift)
+
+                # Do NOT call f4ds.crop_data — it crops to the intersection of
+                # all frames, which removes content visible only in early/late
+                # timepoints and is the root cause of the data loss.
+                #
+                # Instead, trim only the outermost padding that no frame's drift
+                # can ever reach. Pixels beyond (x_pad - max_abs_drift) from
+                # each edge are guaranteed black in every frame regardless of
+                # the sign convention f4ds uses for xy_drift, so they are safe
+                # to remove. Everything else is kept, even if some frames are
+                # black there.
+                max_abs_x = int(np.ceil(np.max(np.abs(xy_drift[:, 0]))))
+                max_abs_y = int(np.ceil(np.max(np.abs(xy_drift[:, 1]))))
+                x_trim = max(0, x_pad - max_abs_x)
+                y_trim = max(0, y_pad - max_abs_y)
+                px, py = int(tmp_data.shape[4]), int(tmp_data.shape[3])
+                tmp_data = tmp_data[
+                    :, :, :,
+                    y_trim : (py - y_trim if y_trim > 0 else py),
+                    x_trim : (px - x_trim if x_trim > 0 else px),
+                ]
+                out_x = px - 2 * x_trim
+                orig_x = int(data.shape[4])
+                f4ds_x = max(0, orig_x - int(np.max(xy_drift[:, 0]) - np.min(xy_drift[:, 0])))
+                print(f"Output x-width: {out_x}px  (original: {orig_x}px, f4ds crop would give ~{f4ds_x}px)")
+
+                if correct_center_rotation:
+                    alpha = f4ds.get_rotation(tmp_data, ref_channel)
+                    tmp_data = f4ds.apply_alpha_drift(tmp_data, alpha)
+                else:
+                    alpha = [0]
+
+                if export_csv:
+                    print("Export drifts to csv.")
+                    x = pd.DataFrame({'x-drift': xy_drift[:, 0]})
+                    y = pd.DataFrame({'y-drift': xy_drift[:, 1]})
+                    r = pd.DataFrame({'rotation': alpha})
+                    df = pd.concat([x, y, r], axis=1)
+                    df = df.fillna(0)
+                    df.to_csv("drifts.csv")
+
+                final_array = np.squeeze(tmp_data, axis=2)
+                final_array = np.moveaxis(final_array, 1, 0)
+                print(f"Output shape (TCYX): {final_array.shape}")
+
+                img_cor_file = Path(output_dir_path) / f"drift_cor_{experiment}_xy{position}.tif"
+                tifffile.imwrite(img_cor_file, final_array, ome=True)
+
+    return output_dir_path
+
+
+def drift_correct_padded(root_dir, experiment_name, pos_list, c=0):
+    """Wrapper that hyperstacks raw TIFFs then runs padded drift correction.
+    Equivalent to drift_correct(..., fast4=True) but preserves x-extent."""
+    if pos_list:
+        try:
+            positions = json.loads(pos_list)
+            for i in range(len(positions)):
+                pos = positions[i]
+                newpos = f"{root_dir}/{pos}"
+                positions[i] = newpos
+        except json.JSONDecodeError:
+            print("ERROR: Could not parse the position list.")
+            return
+    else:
+        positions = False
+
+    hyperstacked_path, _ = hyperstack_tif_tcyx(root_dir, experiment_name, positions, c)
+    return drift_correction_f4ds_padded(hyperstacked_path)
+
 
 def org_by_timepoint(input_dirs):
 	"""Group files by time and channel id, it does not take into account the z axis
