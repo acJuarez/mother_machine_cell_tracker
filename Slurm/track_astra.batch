@@ -5,8 +5,10 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=04:00:00
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=aj0204@stanford.edu
+# Per-job email is intentionally disabled. A single summary email covering all
+# trenches is sent by the trackastra_notify.batch dependency job that
+# submit_trackastra_jobs.py submits after all of these jobs finish.
+#SBATCH --mail-type=NONE
 
 # Arguments passed from the submission script via: sbatch track_astra.batch <base_path> '<json>'
 #   $1 = base path to experiments directory

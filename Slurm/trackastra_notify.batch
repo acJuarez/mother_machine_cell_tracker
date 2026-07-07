@@ -1,0 +1,54 @@
+#!/bin/bash
+#SBATCH --job-name=trackastra_notify
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=1G
+#SBATCH --time=00:05:00
+# Fallback so the user gets exactly one SLURM email if `mail` is unavailable on
+# the compute node. The full completed/failed summary is always in this job's
+# .out log regardless.
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=aj0204@stanford.edu
+
+# Sends a single summary email for a batch of trackastra jobs. Submitted by
+# submit_trackastra_jobs.py with --dependency=afterany:<all experiment job ids>,
+# so it runs once after every experiment job finishes (success or failure).
+#   $1 = space/colon-separated list of experiment job IDs to summarize
+#   $2 = email recipient
+JOB_IDS="$1"
+EMAIL="$2"
+
+# Normalize whatever separators we got (spaces/colons) into a comma list for sacct.
+IDS_CSV=$(echo "$JOB_IDS" | tr ' :' ',,' | sed 's/,\+/,/g; s/^,//; s/,$//')
+
+# One row per job (-X), no header (-n), parseable pipe-delimited (-P).
+SUMMARY=$(sacct -j "$IDS_CSV" -X -n -P --format=JobID,JobName,State,ExitCode)
+
+TOTAL=$(echo "$SUMMARY" | grep -c .)
+COMPLETED=$(echo "$SUMMARY" | grep -c '|COMPLETED|')
+FAILED=$((TOTAL - COMPLETED))
+FAILED_LIST=$(echo "$SUMMARY" | grep -v '|COMPLETED|')
+
+BODY=$(cat <<EOF
+Trackastra batch finished.
+
+Total jobs:    $TOTAL
+Completed:     $COMPLETED
+Not completed: $FAILED
+
+Not-completed jobs (JobID | JobName | State | ExitCode):
+${FAILED_LIST:-  (none)}
+
+Full per-job status (JobID | JobName | State | ExitCode):
+$SUMMARY
+EOF
+)
+
+SUBJECT="Trackastra batch: $COMPLETED/$TOTAL completed"
+
+# Always print to the log; then try to email the summary body.
+echo "$SUBJECT"
+echo "$BODY"
+echo "$BODY" | mail -s "$SUBJECT" "$EMAIL" 2>/dev/null \
+    || echo "NOTE: 'mail' command unavailable; summary above is in this job's log. A bare SLURM email was still sent via --mail-type."

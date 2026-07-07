@@ -16,7 +16,13 @@ args are as follows:
 With --dry-run the sbatch commands are printed but not executed.
 """
 
-def submit_jobs(base_path: str, time_dict_str: str, batch_script: str) -> None:
+def submit_jobs(
+    base_path: str,
+    time_dict_str: str,
+    batch_script: str,
+    notify_batch: str,
+    email: str,
+) -> None:
     time_dict = json.loads(time_dict_str)
 
     jobs = []
@@ -27,6 +33,7 @@ def submit_jobs(base_path: str, time_dict_str: str, batch_script: str) -> None:
 
     print(f"submitting {len(jobs)} job(s).\n")
 
+    job_ids = []
     for exp_name, fov_id, peak_id, time_info in jobs:
         # Build a single-entry JSON so each job only processes one trench
         single_dict = {exp_name: {fov_id: {peak_id: time_info}}}
@@ -44,12 +51,43 @@ def submit_jobs(base_path: str, time_dict_str: str, batch_script: str) -> None:
 
         print(f"experiment: {job_name}")
         print(f" time_range: {time_info}")
-        
+
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
             print(f"-- {result.stdout.strip()}")
+            # sbatch prints "Submitted batch job <ID>"; grab the trailing ID.
+            job_ids.append(result.stdout.strip().split()[-1])
         else:
             print(f"ERROR: {result.stderr.strip()}", file=sys.stderr)
+
+    submit_notifier(job_ids, notify_batch, email)
+
+
+def submit_notifier(job_ids: list, notify_batch: str, email: str) -> None:
+    """Submit one summary-email job that runs after all experiment jobs finish.
+
+    Uses afterany so it fires once every experiment job completes regardless of
+    success/failure, allowing failures to be reported in the single summary email.
+    """
+    if not job_ids:
+        print("\nNo jobs were submitted; skipping summary notifier.", file=sys.stderr)
+        return
+
+    dependency = "afterany:" + ":".join(job_ids)
+    cmd = [
+        "sbatch",
+        f"--dependency={dependency}",
+        notify_batch,
+        " ".join(job_ids),
+        email,
+    ]
+
+    print(f"\nsubmitting summary notifier for {len(job_ids)} job(s).")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"-- {result.stdout.strip()}")
+    else:
+        print(f"ERROR submitting notifier: {result.stderr.strip()}", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -71,6 +109,22 @@ if __name__ == "__main__":
         default="/home/users/aj0204/repos/mother_machine_cell_tracker/Slurm/track_astra.batch",
         help="Path to the SLURM batch script (default: Slurm/track_astra.batch)",
     )
-    
+    parser.add_argument(
+        "--notify-batch",
+        default="/home/users/aj0204/repos/mother_machine_cell_tracker/Slurm/trackastra_notify.batch",
+        help="Path to the summary-email SLURM batch script (default: Slurm/trackastra_notify.batch)",
+    )
+    parser.add_argument(
+        "--email",
+        default="aj0204@stanford.edu",
+        help="Recipient for the single summary email (default: aj0204@stanford.edu)",
+    )
+
     args = parser.parse_args()
-    submit_jobs(args.base_path, args.time_dict, args.batch_script)
+    submit_jobs(
+        args.base_path,
+        args.time_dict,
+        args.batch_script,
+        args.notify_batch,
+        args.email,
+    )
