@@ -68,7 +68,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--batch-script",
-        default="Slurm/track_astra.batch",
+        default="/home/users/aj0204/repos/mother_machine_cell_tracker/Slurm/track_astra.batch",
         help="Path to the SLURM batch script (default: Slurm/track_astra.batch)",
     )
     
