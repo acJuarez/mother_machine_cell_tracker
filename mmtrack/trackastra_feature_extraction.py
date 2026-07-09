@@ -1,10 +1,10 @@
 """
-Feature extraction from trackastra tracking outputs.
+Feature extraction doing bulk of the work for 06_trackastra_feature_extraction.py
 
-Replaces Stages 4 and 5 for experiments tracked with trackastra.
 Extracts per-cell morphological/intensity features from CTC-format tracked masks,
 assigns hierarchical lineage IDs, generates kymograph TIFFs, and saves a
-per-experiment DataFrame compatible with the existing plot_cells.py functions.
+per-experiment DataFrame compatible with the existing plot_cells.py functions. Uses regionprops
+like previous iteration of pipeline used to extract cell features 
 
 Expected trackastra output files (produced by run_trackastra_sherlock.py):
     {exp}_ctc_masks_{fov}_{peak}.npy          -- (T, Y, X) tracked label masks
@@ -171,7 +171,7 @@ def process_trench(
     frame_dfs = [d for d in frame_dfs if not d.empty]
 
     if not frame_dfs:
-        print(f"      XARNING: no cells found in any frame for {folder}/{fov_id}/{peak_id}")
+        print(f"      WARNING: no cells found in any frame for {folder}/{fov_id}/{peak_id}")
         return pd.DataFrame()
 
     df = pd.concat(frame_dfs, ignore_index=True)
@@ -209,7 +209,7 @@ def discover_trackastra_outputs(trackastra_dir):
         name = os.path.basename(f)[:-4]  # strip .npy
         if '_ctc_masks_' not in name:
             continue
-        folder, rest = name.split('_ctc_mastracks_', 1)
+        folder, rest = name.split('_ctc_masks_', 1)
         # rest = "{fov}_{peak}", peak may contain underscores so split from right
         parts = rest.rsplit('_', 1)
         if len(parts) != 2:
@@ -311,7 +311,7 @@ def run_trackastra_feature_extraction(
                         end = time_info.get('end') or start + ctc_masks.shape[0]
                         phase_trimmed = tifffile.imread(path_phase)[start:end]
                     except FileNotFoundError as exc:
-                        print(f"    XARNING: {exc}. Skipping trench {peak_id}.")
+                        print(f"    WARNING: {exc}. Skipping trench {peak_id}.")
                         continue
 
                 # --- Load fluorescence from original TIFF ---
@@ -320,7 +320,7 @@ def run_trackastra_feature_extraction(
                     end = time_info.get('end') or start + ctc_masks.shape[0]
                     fluor_trimmed = tifffile.imread(path_fluor)[start:end]
                 except FileNotFoundError as exc:
-                    print(f"    XARNING: {exc}. Skipping trench {peak_id}.")
+                    print(f"    WARNING: {exc}. Skipping trench {peak_id}.")
                     continue
 
                 # --- Reconcile frame counts defensively ---
