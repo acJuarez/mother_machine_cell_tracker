@@ -284,7 +284,23 @@ def render_mask(ctc_masks, downscale):
     return _img_to_base64(pil, "PNG")
 
 
-def render_tracks_svg(tracks, graph, img_width, kymo_shape, downscale):
+def build_track_color_map(track_ids):
+    """Map each track_id to an "rgb(r,g,b)" string via tab20 (position-based).
+
+    Shared by the tracks overlay, labels layer, and fluorescence charts so a given
+    lineage has the same color everywhere. IDs are sorted ascending (matches
+    np.unique) before assigning colors.
+    """
+    import matplotlib.pyplot as plt
+    tab20 = plt.colormaps["tab20"]
+    color_map = {}
+    for i, tid in enumerate(np.unique(np.asarray(list(track_ids)))):
+        c = tab20(int(i) % 20)
+        color_map[tid] = f"rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})"
+    return color_map
+
+
+def render_tracks_svg(tracks, graph, img_width, kymo_shape, downscale, color_map):
     """Return an inline SVG string with track polylines and division connectors."""
     if tracks is None or len(tracks) == 0:
         return ""
@@ -295,19 +311,12 @@ def render_tracks_svg(tracks, graph, img_width, kymo_shape, downscale):
     svg_w = int(w * sx)
     svg_h = int(h * sy)
 
-    import matplotlib.pyplot as plt
-    tab20 = plt.colormaps["tab20"]
-
     # Transform track coords to kymograph space
     track_ids = tracks[:, 0]
     new_x = tracks[:, 1] * img_width + tracks[:, 3]
     y_coords = tracks[:, 2]
 
     unique_ids = np.unique(track_ids)
-    color_map = {}
-    for i, tid in enumerate(unique_ids):
-        c = tab20(int(i) % 20)
-        color_map[tid] = f"rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})"
 
     lines = []
     lines.append(
@@ -346,6 +355,168 @@ def render_tracks_svg(tracks, graph, img_width, kymo_shape, downscale):
 
     lines.append("</svg>")
     return "\n".join(lines)
+
+
+def render_labels_svg(tracks, img_width, kymo_shape, downscale, color_map):
+    """Return an inline SVG overlay with a track_id text label at each track's start.
+
+    Mirrors the napari 'track_labels' points layer: one label per lineage, placed at
+    the cell's first appearance, colored to match its track/plot color.
+    """
+    if tracks is None or len(tracks) == 0:
+        return ""
+
+    h, w = kymo_shape
+    svg_w = int(w * downscale)
+    svg_h = int(h * downscale)
+
+    track_ids = tracks[:, 0]
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{svg_w}" height="{svg_h}" '
+        f'viewBox="0 0 {svg_w} {svg_h}" style="position:absolute;top:0;left:0;">'
+    ]
+    for tid in np.unique(track_ids):
+        rows = tracks[track_ids == tid]
+        first = rows[np.argmin(rows[:, 1])]  # earliest time_frame
+        x = (first[1] * img_width + first[3]) * downscale
+        y = first[2] * downscale
+        color = color_map.get(tid, "#ffff00")
+        lines.append(
+            f'<text x="{x:.1f}" y="{y:.1f}" font-size="10" fill="{color}" '
+            f'style="paint-order:stroke;stroke:#000;stroke-width:2px;stroke-linejoin:round;" '
+            f'dominant-baseline="hanging">{int(tid)}</text>'
+        )
+    lines.append("</svg>")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Fluorescence-vs-time charts (mirrors notebook plot_track_fluorescence)
+# ---------------------------------------------------------------------------
+
+def compute_track_fluorescence(ctc_masks, fluor, start_frame):
+    """Per-track mean fluorescence over time.
+
+    Returns {track_id: [(abs_frame, mean_val), ...]} sorted by frame, or None when
+    no fluorescence is available. Mean over fluor pixels where ctc_masks == label is
+    identical to the 'intensity_mean_fluor' feature (mask label == track_id).
+    """
+    if fluor is None:
+        return None
+
+    from scipy import ndimage
+
+    n = min(ctc_masks.shape[0], fluor.shape[0])
+    series = defaultdict(list)
+    for t in range(n):
+        mask_t = ctc_masks[t]
+        labels = np.unique(mask_t)
+        labels = labels[labels != 0]
+        if labels.size == 0:
+            continue
+        means = ndimage.mean(fluor[t], labels=mask_t, index=labels)
+        for lab, m in zip(labels, np.atleast_1d(means)):
+            series[int(lab)].append((start_frame + t, float(m)))
+
+    if not series:
+        return None
+    return {tid: sorted(pts) for tid, pts in series.items()}
+
+
+def _linspace_ticks(lo, hi, n=4):
+    if hi <= lo:
+        return [lo]
+    step = (hi - lo) / n
+    return [lo + step * i for i in range(n + 1)]
+
+
+def _render_one_panel(series, color_map, title, x_of, x_lo, x_hi, y_lo, y_hi,
+                      width=460, height=200):
+    """Render a single line-chart panel as an <svg>. x_of maps (frame, track_pts)->x value."""
+    ml, mr, mt, mb = 52, 12, 24, 34  # margins
+    plot_w = width - ml - mr
+    plot_h = height - mt - mb
+
+    def sx(xv):
+        if x_hi <= x_lo:
+            return ml
+        return ml + (xv - x_lo) / (x_hi - x_lo) * plot_w
+
+    def sy(yv):
+        if y_hi <= y_lo:
+            return mt + plot_h
+        return mt + plot_h - (yv - y_lo) / (y_hi - y_lo) * plot_h
+
+    out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" class="fluor-svg">'
+    ]
+    out.append(f'<text x="{ml}" y="14" class="fl-title">{title}</text>')
+    # axes
+    out.append(f'<line x1="{ml}" y1="{mt}" x2="{ml}" y2="{mt+plot_h}" class="fl-axis"/>')
+    out.append(f'<line x1="{ml}" y1="{mt+plot_h}" x2="{ml+plot_w}" y2="{mt+plot_h}" class="fl-axis"/>')
+    # y ticks
+    for yv in _linspace_ticks(y_lo, y_hi):
+        yy = sy(yv)
+        out.append(f'<line x1="{ml-3}" y1="{yy:.1f}" x2="{ml}" y2="{yy:.1f}" class="fl-axis"/>')
+        out.append(f'<text x="{ml-5}" y="{yy+3:.1f}" class="fl-tick" text-anchor="end">{yv:.0f}</text>')
+    # x ticks
+    for xv in _linspace_ticks(x_lo, x_hi):
+        xx = sx(xv)
+        out.append(f'<line x1="{xx:.1f}" y1="{mt+plot_h}" x2="{xx:.1f}" y2="{mt+plot_h+3}" class="fl-axis"/>')
+        out.append(f'<text x="{xx:.1f}" y="{mt+plot_h+14:.1f}" class="fl-tick" text-anchor="middle">{xv:.0f}</text>')
+
+    for tid in sorted(series):
+        pts = series[tid]
+        color = color_map.get(tid, "#888")
+        coords = " ".join(f"{sx(x_of(fr, pts)):.1f},{sy(val):.1f}" for fr, val in pts)
+        out.append(
+            f'<polyline points="{coords}" fill="none" stroke="{color}" '
+            f'stroke-width="1.5" stroke-opacity="0.9" data-track="{tid}" data-color="{color}"/>'
+        )
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def render_fluor_charts(series, color_map, start_frame, end_frame, card_id):
+    """Two stacked panels (raw time, elapsed-per-track) + a cell_id dropdown.
+
+    Returns HTML for the right-hand fluorescence panel of a kymograph card.
+    """
+    if not series:
+        return (
+            f'<div class="fluor-panel" data-card="{card_id}">'
+            f'<div class="fluor-none">No fluorescence data</div></div>'
+        )
+
+    all_vals = [v for pts in series.values() for _, v in pts]
+    y_lo, y_hi = min(all_vals), max(all_vals)
+    max_elapsed = max((pts[-1][0] - pts[0][0]) for pts in series.values())
+
+    raw_panel = _render_one_panel(
+        series, color_map, "Mean fluorescence — raw time",
+        x_of=lambda fr, pts: fr, x_lo=start_frame, x_hi=end_frame,
+        y_lo=y_lo, y_hi=y_hi,
+    )
+    elapsed_panel = _render_one_panel(
+        series, color_map, "Mean fluorescence — frames since track start",
+        x_of=lambda fr, pts: fr - pts[0][0], x_lo=0, x_hi=max_elapsed,
+        y_lo=y_lo, y_hi=y_hi,
+    )
+
+    options = ['<option value="">All tracks</option>']
+    options += [f'<option value="{tid}">cell {tid}</option>' for tid in sorted(series)]
+
+    return f"""\
+<div class="fluor-panel" data-card="{card_id}">
+  <div class="fluor-select">
+    <label>Highlight lineage:
+      <select class="cell-select" data-card="{card_id}">{''.join(options)}</select>
+    </label>
+  </div>
+  {raw_panel}
+  {elapsed_panel}
+</div>"""
 
 
 # ---------------------------------------------------------------------------
@@ -390,12 +561,22 @@ HTML_TEMPLATE = """\
   .kymo-card h3 {{ padding: 10px 16px; font-size: 0.85em; font-weight: 500;
                    border-bottom: 1px solid var(--border); }}
   .kymo-card h3 strong {{ color: var(--tab-active); }}
+  .kymo-body {{ display: flex; gap: 16px; align-items: flex-start; padding: 12px 16px; }}
   .kymo-container {{ position: relative; overflow-x: auto; overflow-y: hidden;
-                     line-height: 0; }}
+                     line-height: 0; flex: 1 1 auto; min-width: 0; }}
   .kymo-container img, .kymo-container svg {{
     display: block; max-width: none;
   }}
   .kymo-container .layer {{ position: absolute; top: 0; left: 0; }}
+  .fluor-panel {{ flex: 0 0 auto; }}
+  .fluor-select {{ font-size: 0.85em; margin-bottom: 6px; }}
+  .fluor-select select {{ background: var(--tab-bg); color: var(--fg);
+                          border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; }}
+  .fluor-svg {{ display: block; }}
+  .fluor-svg .fl-axis {{ stroke: var(--fg); stroke-opacity: 0.5; stroke-width: 1; }}
+  .fluor-svg .fl-tick {{ fill: var(--fg); font-size: 9px; opacity: 0.7; }}
+  .fluor-svg .fl-title {{ fill: var(--fg); font-size: 11px; font-weight: 600; }}
+  .fluor-none {{ font-size: 0.85em; opacity: 0.6; padding: 8px; }}
   .summary {{ padding: 8px 24px; font-size: 0.8em; opacity: 0.6; }}
 </style>
 
@@ -418,13 +599,17 @@ HTML_TEMPLATE = """\
     <input type="checkbox" id="chk-tracks" checked>
     <label for="chk-tracks">Tracks</label>
   </div>
+  <div class="ctrl-group">
+    <input type="checkbox" id="chk-labels">
+    <label for="chk-labels">Labels</label>
+  </div>
 </div>
 {gene_panels}
 <script>
 (function() {{
   const tabs = document.querySelectorAll('#gene-tabs button');
   const panels = document.querySelectorAll('.gene-panel');
-  const layers = ['phase','fluor','mask','tracks'];
+  const layers = ['phase','fluor','mask','tracks','labels'];
 
   function switchTab(gene) {{
     tabs.forEach(t => t.classList.toggle('active', t.dataset.gene === gene));
@@ -445,6 +630,32 @@ HTML_TEMPLATE = """\
     document.getElementById('chk-' + layer).addEventListener('change', applyLayers);
   }});
   applyLayers();
+
+  // Per-card lineage highlight in the fluorescence charts (plot only).
+  document.querySelectorAll('.cell-select').forEach(sel => {{
+    sel.addEventListener('change', () => {{
+      const card = sel.dataset.card;
+      const sel_id = sel.value;
+      const panel = document.querySelector('.fluor-panel[data-card="' + card + '"]');
+      if (!panel) return;
+      panel.querySelectorAll('polyline').forEach(pl => {{
+        const color = pl.dataset.color;
+        if (sel_id === '') {{
+          pl.setAttribute('stroke', color);
+          pl.setAttribute('stroke-width', '1.5');
+          pl.setAttribute('stroke-opacity', '0.9');
+        }} else if (pl.dataset.track === sel_id) {{
+          pl.setAttribute('stroke', color);
+          pl.setAttribute('stroke-width', '2.5');
+          pl.setAttribute('stroke-opacity', '1');
+        }} else {{
+          pl.setAttribute('stroke', '#888');
+          pl.setAttribute('stroke-width', '1');
+          pl.setAttribute('stroke-opacity', '0.3');
+        }}
+      }});
+    }});
+  }});
 }})();
 </script>
 """
@@ -493,10 +704,19 @@ def generate_viewer(args):
             start_frame = data["start_frame"]
             end_frame = data["end_frame"]
 
+            color_map = build_track_color_map(tracks[:, 0]) if tracks is not None and len(tracks) else {}
+
             phase_b64, kymo_shape, label_bar_h = render_phase(imgs, args.downscale, args.jpeg_quality, start_frame)
             fluor_b64 = render_fluor(fluor, args.downscale, args.jpeg_quality) if fluor is not None else None
             mask_b64 = render_mask(ctc_masks, args.downscale)
-            tracks_svg = render_tracks_svg(tracks, graph, imgs.shape[2], kymo_shape, args.downscale)
+            tracks_svg = render_tracks_svg(tracks, graph, imgs.shape[2], kymo_shape, args.downscale, color_map)
+            labels_svg = render_labels_svg(tracks, imgs.shape[2], kymo_shape, args.downscale, color_map)
+
+            fluor_series = compute_track_fluorescence(ctc_masks, fluor, start_frame)
+            card_id = f"{exp}_{fov}_{peak}"
+            fluor_charts = render_fluor_charts(
+                fluor_series, color_map, start_frame, end_frame, card_id
+            )
 
             kymo_w = int(kymo_shape[1] * args.downscale)
             kymo_h = int(kymo_shape[0] * args.downscale)
@@ -514,15 +734,26 @@ def generate_viewer(args):
             if tracks_svg:
                 tracks_div = f'<div class="layer layer-tracks" style="height:{kymo_h}px;">{tracks_svg}</div>'
 
+            labels_div = ""
+            if labels_svg:
+                labels_div = (
+                    f'<div class="layer layer-labels" '
+                    f'style="height:{kymo_h}px;display:none;">{labels_svg}</div>'
+                )
+
             cards_html += f"""\
 <div class="kymo-card">
   <h3><strong>{gene}</strong> &mdash; {exp} | FOV {fov} | Trench {peak} | Frames {start_frame}&ndash;{end_frame}</h3>
-  <div class="kymo-container">
-    <div style="width:{kymo_w}px;height:{total_h}px;"></div>
-    <img class="layer layer-phase" src="data:image/jpeg;base64,{phase_b64}" />
-    {fluor_img}
-    <img class="layer layer-mask" src="data:image/png;base64,{mask_b64}" style="height:{kymo_h}px;" />
-    {tracks_div}
+  <div class="kymo-body">
+    <div class="kymo-container">
+      <div style="width:{kymo_w}px;height:{total_h}px;"></div>
+      <img class="layer layer-phase" src="data:image/jpeg;base64,{phase_b64}" />
+      {fluor_img}
+      <img class="layer layer-mask" src="data:image/png;base64,{mask_b64}" style="height:{kymo_h}px;" />
+      {tracks_div}
+      {labels_div}
+    </div>
+    {fluor_charts}
   </div>
 </div>
 """
