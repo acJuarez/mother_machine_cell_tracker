@@ -112,6 +112,15 @@ def build_combined_dict():
 
 
 # ---------------------------------------------------------------------------
+# Fluorescence denoising
+# ---------------------------------------------------------------------------
+
+# Filter implementations are shared with the track-displacement analysis so both
+# apply identical denoising. See mmtrack/fluor_filters.py.
+from mmtrack.fluor_filters import denoise_fluor  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
@@ -132,7 +141,9 @@ def build_kymograph_list(combined_dict, time_dict, trackastra_dir):
     return kymos
 
 
-def load_kymograph_data(exp, fov, peak, time_dict, base_dir, trackastra_dir):
+def load_kymograph_data(exp, fov, peak, time_dict, base_dir, trackastra_dir,
+                        fluor_filter="none", filter_size=3, filter_sigma=1.0,
+                        nlm_h=1.15, otsu_scale=1.0):
     """Load all arrays for a single kymograph. Returns dict or None on failure."""
     imgs_path = os.path.join(trackastra_dir, f"{exp}_imgs_{fov}_{peak}.npy")
     ctc_path = os.path.join(trackastra_dir, f"{exp}_ctc_masks_{fov}_{peak}.npy")
@@ -179,6 +190,12 @@ def load_kymograph_data(exp, fov, peak, time_dict, base_dir, trackastra_dir):
         except Exception:
             fluor = None
 
+    # Denoised copy for the "filtered" layer. Charts intentionally keep using the
+    # raw `fluor` below; the two image layers are the visual assessment tool.
+    fluor_filtered = denoise_fluor(
+        fluor, fluor_filter, filter_size, filter_sigma, nlm_h, otsu_scale
+    )
+
     start_frame = time_dict[exp][fov][peak].get("start", 0)
     end_frame = start_frame + imgs.shape[0] - 1
 
@@ -188,6 +205,7 @@ def load_kymograph_data(exp, fov, peak, time_dict, base_dir, trackastra_dir):
         "tracks": tracks,
         "graph": graph,
         "fluor": fluor,
+        "fluor_filtered": fluor_filtered,
         "start_frame": start_frame,
         "end_frame": end_frame,
     }
@@ -592,6 +610,10 @@ HTML_TEMPLATE = """\
     <label for="chk-fluor">Fluorescence</label>
   </div>
   <div class="ctrl-group">
+    <input type="checkbox" id="chk-fluorfilt">
+    <label for="chk-fluorfilt">Fluorescence (filtered)</label>
+  </div>
+  <div class="ctrl-group">
     <input type="checkbox" id="chk-mask" checked>
     <label for="chk-mask">Masks</label>
   </div>
@@ -609,7 +631,7 @@ HTML_TEMPLATE = """\
 (function() {{
   const tabs = document.querySelectorAll('#gene-tabs button');
   const panels = document.querySelectorAll('.gene-panel');
-  const layers = ['phase','fluor','mask','tracks','labels'];
+  const layers = ['phase','fluor','fluorfilt','mask','tracks','labels'];
 
   function switchTab(gene) {{
     tabs.forEach(t => t.classList.toggle('active', t.dataset.gene === gene));
@@ -673,8 +695,20 @@ def generate_viewer(args):
         time_dict = json.load(f)
 
     combined_dict = build_combined_dict()
+
+    if getattr(args, "genes", None):
+        wanted = {g.strip() for g in args.genes.split(",") if g.strip()}
+        combined_dict = {g: v for g, v in combined_dict.items() if g in wanted}
+        missing = wanted - set(combined_dict)
+        if missing:
+            print(f"WARNING: requested genes not found in mapping: {sorted(missing)}")
+        print(f"Restricting to genes: {sorted(combined_dict)}")
+
     kymo_list = build_kymograph_list(combined_dict, time_dict, args.trackastra_dir)
     print(f"Found {len(kymo_list)} kymographs to render")
+    print(f"Fluor filter: {args.fluor_filter} "
+          f"(size={args.filter_size}, sigma={args.filter_sigma}, "
+          f"nlm_h={args.nlm_h}, otsu_scale={args.otsu_scale})")
 
     kymos_by_gene = defaultdict(list)
     for gene, exp, fov, peak in kymo_list:
@@ -692,7 +726,14 @@ def generate_viewer(args):
         cards_html = ""
         entries = kymos_by_gene[gene]
         for exp, fov, peak in tqdm(entries, desc=f"  {gene}", leave=False):
-            data = load_kymograph_data(exp, fov, peak, time_dict, args.base_dir, args.trackastra_dir)
+            data = load_kymograph_data(
+                exp, fov, peak, time_dict, args.base_dir, args.trackastra_dir,
+                fluor_filter=args.fluor_filter,
+                filter_size=args.filter_size,
+                filter_sigma=args.filter_sigma,
+                nlm_h=args.nlm_h,
+                otsu_scale=args.otsu_scale,
+            )
             if data is None:
                 continue
 
@@ -701,6 +742,7 @@ def generate_viewer(args):
             tracks = data["tracks"]
             graph = data["graph"]
             fluor = data["fluor"]
+            fluor_filtered = data["fluor_filtered"]
             start_frame = data["start_frame"]
             end_frame = data["end_frame"]
 
@@ -708,6 +750,11 @@ def generate_viewer(args):
 
             phase_b64, kymo_shape, label_bar_h = render_phase(imgs, args.downscale, args.jpeg_quality, start_frame)
             fluor_b64 = render_fluor(fluor, args.downscale, args.jpeg_quality) if fluor is not None else None
+            fluor_filt_b64 = (
+                render_fluor(fluor_filtered, args.downscale, args.jpeg_quality)
+                if fluor_filtered is not None and args.fluor_filter != "none"
+                else None
+            )
             mask_b64 = render_mask(ctc_masks, args.downscale)
             tracks_svg = render_tracks_svg(tracks, graph, imgs.shape[2], kymo_shape, args.downscale, color_map)
             labels_svg = render_labels_svg(tracks, imgs.shape[2], kymo_shape, args.downscale, color_map)
@@ -730,6 +777,14 @@ def generate_viewer(args):
                     f'style="display:none;height:{kymo_h}px;" />'
                 )
 
+            fluor_filt_img = ""
+            if fluor_filt_b64:
+                fluor_filt_img = (
+                    f'<img class="layer layer-fluorfilt" '
+                    f'src="data:image/jpeg;base64,{fluor_filt_b64}" '
+                    f'style="display:none;height:{kymo_h}px;" />'
+                )
+
             tracks_div = ""
             if tracks_svg:
                 tracks_div = f'<div class="layer layer-tracks" style="height:{kymo_h}px;">{tracks_svg}</div>'
@@ -749,6 +804,7 @@ def generate_viewer(args):
       <div style="width:{kymo_w}px;height:{total_h}px;"></div>
       <img class="layer layer-phase" src="data:image/jpeg;base64,{phase_b64}" />
       {fluor_img}
+      {fluor_filt_img}
       <img class="layer layer-mask" src="data:image/png;base64,{mask_b64}" style="height:{kymo_h}px;" />
       {tracks_div}
       {labels_div}
@@ -806,6 +862,44 @@ def main():
         type=int,
         default=80,
         help="JPEG quality for phase/fluor layers (1-100)",
+    )
+    parser.add_argument(
+        "--fluor-filter",
+        choices=["none", "median", "mean", "gaussian", "nlm", "otsu"],
+        default="nlm",
+        help="Denoising filter for the 'Fluorescence (filtered)' layer. "
+             "'nlm' = non-local means (strongest). 'otsu' = median + global Otsu "
+             "background subtraction. 'none' disables the filtered layer.",
+    )
+    parser.add_argument(
+        "--filter-size",
+        type=int,
+        default=3,
+        help="Square footprint size for the median / mean filter",
+    )
+    parser.add_argument(
+        "--filter-sigma",
+        type=float,
+        default=1.0,
+        help="Standard deviation for the gaussian filter",
+    )
+    parser.add_argument(
+        "--nlm-h",
+        type=float,
+        default=1.15,
+        help="Non-local means strength multiplier (higher = smoother)",
+    )
+    parser.add_argument(
+        "--otsu-scale",
+        type=float,
+        default=1.0,
+        help="Multiplier on the global Otsu threshold for the 'otsu' filter "
+             "(>1 = more aggressive background removal, <1 = keeps more dim signal)",
+    )
+    parser.add_argument(
+        "--genes",
+        default=None,
+        help="Comma-separated genes to render (e.g. 'lacZ'). Default: all genes.",
     )
     args = parser.parse_args()
     generate_viewer(args)
