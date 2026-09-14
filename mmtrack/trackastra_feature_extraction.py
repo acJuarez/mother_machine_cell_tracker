@@ -9,7 +9,18 @@ like previous iteration of pipeline used to extract cell features
 Expected trackastra output files (produced by run_trackastra_sherlock.py):
     {exp}_ctc_masks_{fov}_{peak}.npy          -- (T, Y, X) tracked label masks
     {exp}_imgs_{fov}_{peak}.npy               -- (T, Y, X) trimmed phase stack
-    {exp}_napari_tracks_graph_{fov}_{peak}.json  -- {daughter_track_id: parent_track_id}
+    {exp}_ctc_tracks_{fov}_{peak}.csv         -- CTC track table: label, t1, t2, parent
+                                                 (parent == 0 means root). THE lineage source.
+
+TWO LABEL SPACES -- do not mix them. `track_id` here is the ctc_masks label. The sibling
+file {exp}_napari_tracks_{fov}_{peak}.npy uses a *different* numbering, and
+{exp}_napari_tracks_graph_{fov}_{peak}.json is keyed in that napari space. Mapping the
+napari graph onto track_id therefore attributes each division to the wrong cells; it
+disagreed with the CTC parents in 99 of 293 trenches (~34%) on the 082026 generation, and
+produced impossible parent->daughter frame gaps (a "parent" alive in the same frame as its
+"daughter"). ctc_tracks_*.csv is already in ctc_masks label space, so it is used instead.
+Translating the napari graph through a centroid-matched label map reproduces the CTC
+parents exactly, which is what confirmed the two files disagree only by relabeling.
 
 Output DataFrame columns (one row per cell × time frame):
     node_id, track_id, time_frame
@@ -24,7 +35,6 @@ Output DataFrame columns (one row per cell × time frame):
 """
 
 import glob
-import json
 import os
 from collections import defaultdict
 
@@ -35,7 +45,28 @@ from skimage.measure import regionprops_table
 
 from mmtrack import plot_cells
 
-def assign_lineage_ids(napari_tracks_graph, all_track_ids):
+def load_ctc_lineage_graph(ctc_tracks_csv):
+    """
+    Build {daughter_label: parent_label} from a CTC tracks CSV.
+
+    The CSV has one row per track: label, t1 (first frame), t2 (last frame), parent
+    (0 == root). Labels are ctc_masks values, i.e. the same space as `track_id`, which is
+    why this and not napari_tracks_graph_*.json is the lineage source (see module
+    docstring). Root rows are dropped so the returned dict has the same shape as the old
+    napari graph and can be handed straight to assign_lineage_ids.
+    """
+    tracks = pd.read_csv(ctc_tracks_csv)
+    missing = {'label', 'parent'} - set(tracks.columns)
+    if missing:
+        raise ValueError(f"{ctc_tracks_csv} is missing column(s) {sorted(missing)}")
+    return {
+        int(row.label): int(row.parent)
+        for row in tracks.itertuples()
+        if int(row.parent) != 0
+    }
+
+
+def assign_lineage_ids(lineage_graph, all_track_ids):
     """
     Build hierarchical lineage ID strings matching Stage 5 naming convention.
 
@@ -44,19 +75,21 @@ def assign_lineage_ids(napari_tracks_graph, all_track_ids):
     - Two+ children of a track (division): daughters get "parent_id.1", "parent_id.2", ...
 
     Args:
-        napari_tracks_graph: dict {daughter_track_id (int): parent_track_id (int)}
+        lineage_graph: dict {daughter_track_id (int): parent_track_id (int)}, in the SAME
+                       label space as all_track_ids (i.e. ctc_masks labels, as returned by
+                       load_ctc_lineage_graph -- not the napari graph JSON).
         all_track_ids: iterable of all track IDs present in the data
 
     Returns:
         dict {track_id (int): lineage_id_string}
     """
     parent_to_children = defaultdict(list)
-    for daughter, parent in napari_tracks_graph.items():
+    for daughter, parent in lineage_graph.items():
         parent_to_children[parent].append(daughter)
     for parent in parent_to_children:
         parent_to_children[parent].sort()
 
-    daughters = set(napari_tracks_graph.keys())
+    daughters = set(lineage_graph.keys())
     roots = sorted(t for t in all_track_ids if t not in daughters)
 
     track_to_lineage = {}
@@ -130,7 +163,7 @@ def process_trench(
     ctc_masks,
     phase_stack,
     fluor_stack,
-    napari_tracks_graph,
+    lineage_graph,
     folder,
     fov_id,
     peak_id,
@@ -143,7 +176,8 @@ def process_trench(
         ctc_masks: (T, Y, X) ndarray — trackastra tracked label masks (label == track_id)
         phase_stack: (T, Y, X) ndarray — phase images, trimmed to match ctc_masks
         fluor_stack: (T, Y, X) ndarray — fluorescence images, trimmed to match ctc_masks
-        napari_tracks_graph: dict {daughter_track_id: parent_track_id}
+        lineage_graph: dict {daughter_track_id: parent_track_id} in ctc_masks label
+                       space (see load_ctc_lineage_graph)
         folder, fov_id, peak_id: experiment metadata identifiers
         kymo_output_dir: directory where kymograph TIFFs are written
 
@@ -178,9 +212,11 @@ def process_trench(
 
     # --- Lineage assignment ---
     all_track_ids = df['track_id'].unique().tolist()
-    track_to_lineage = assign_lineage_ids(napari_tracks_graph, all_track_ids)
+    track_to_lineage = assign_lineage_ids(lineage_graph, all_track_ids)
     df['predicted_lineage'] = df['track_id'].map(track_to_lineage).fillna('untracked')
-    df['parent_track_id'] = df['track_id'].map(napari_tracks_graph)  # NaN for roots
+    # lineage_graph is keyed by ctc_masks label, the same space as track_id, so this map is
+    # label-for-label. NaN means root.
+    df['parent_track_id'] = df['track_id'].map(lineage_graph)
 
     # --- Metadata ---
     df['experiment_name'] = folder
@@ -243,7 +279,7 @@ def run_trackastra_feature_extraction(
 
     Args:
         base_path: root directory containing experiment folders
-        trackastra_dir: directory holding trackastra output .npy / .json files
+        trackastra_dir: directory holding trackastra output .npy / .csv files
         time_range_dict: nested dict {exp: {fov: {peak: {'start': int, 'end': int|None}}}}
                          If None or empty, outputs are auto-discovered with start=0.
         phase_c_str: phase channel index string (for original TIFF filename)
@@ -273,15 +309,16 @@ def run_trackastra_feature_extraction(
                 ctc_path = os.path.join(
                     trackastra_dir, f'{folder}_ctc_masks_{fov_id}_{peak_id}.npy'
                 )
-                graph_path = os.path.join(
-                    trackastra_dir, f'{folder}_napari_tracks_graph_{fov_id}_{peak_id}.json'
+                # Lineage comes from the CTC track table, which is in the same label
+                # space as ctc_masks. There is no fallback to the napari graph JSON: it is
+                # keyed in the napari track-id space and is wrong for ~1/3 of trenches
+                # (see module docstring), so a silent fallback would reintroduce the bug.
+                tracks_path = os.path.join(
+                    trackastra_dir, f'{folder}_ctc_tracks_{fov_id}_{peak_id}.csv'
                 )
                 try:
                     ctc_masks = np.load(ctc_path)
-                    with open(graph_path) as fh:
-                        napari_tracks_graph = {
-                            int(k): int(v) for k, v in json.load(fh).items()
-                        }
+                    lineage_graph = load_ctc_lineage_graph(tracks_path)
                 except FileNotFoundError as exc:
                     print(f"WARNING: {exc}. Skipping trench {peak_id}.")
                     continue
@@ -334,7 +371,7 @@ def run_trackastra_feature_extraction(
                 # --- Run per-trench pipeline ---
                 df_trench = process_trench(
                     ctc_masks, phase_trimmed, fluor_trimmed,
-                    napari_tracks_graph,
+                    lineage_graph,
                     folder, fov_id, peak_id,
                     kymo_output_dir=subtracted_dir,
                 )

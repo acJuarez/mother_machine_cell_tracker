@@ -11,7 +11,7 @@ call time by a ``build_combined_dict()`` helper; both are gone. There is one
 ``STRAIN_EXP_DICT`` and new experiments go straight into it.
 
 Keys are experiment folder names as they appear on disk and in ``time_dict_*.json``.
-Entries ending in ``_v2`` refer to såperseded acquisitions that have since been
+Entries ending in ``_v2`` refer to superseded acquisitions that have since been
 reprocessed under new peak IDs; they are retained for provenance and match no current
 data.
 """
@@ -57,13 +57,14 @@ STRAIN_EXP_DICT = {
     },
     "hupA": {
         "DUMM_giTG068_052925": ["005"],
+        "DUMM_giTG068_059__lactose_062025": ["009"],
         "DUMM_giTG068_063_061725": ["012"],
     },
     "lacZ": {
         "DUMM_giTG059_060_061125": ["008"],
         "DUMM_giTG059_068_SC_093025": ["015", "020"],
         "DUMM_giTG059_noKan_Glucose_031125": ["004"],
-        "DUMM_giTG068_059__lactose_062025": ["000", "001", "002", "009"],
+        "DUMM_giTG068_059__lactose_062025": ["000", "001", "002"],
     },
     "mazF": {
         "DUMM_giTG059_060_061125": ["015"],
@@ -131,6 +132,21 @@ EXPOSURE_MS = {
     "DUMM_mazF_murQ_121625": [120, 150],
     "DUMM_giTG068_059__lactose_062025": [90, 150],
 }
+
+# Acquisitions considered failed. They are present in every data file -- dropped nowhere at
+# source -- and tagged by the `is_failed_experiment` column in the annotated exports, so an
+# analysis opts out with `df[~df.is_failed_experiment]` rather than by re-typing this tuple.
+#
+# Cost of excluding them, measured on the 082026 export: 1,220 of 12,696 unique cells (9.6%)
+# and 37 of 292 trenches, touching 5 genes -- chpS -37%, gfcE -20%, alkA -18%, hupA -18%,
+# lacZ -7%. araB, baeS, gldA, mazF and murQ are untouched, and all 10 genes and all 4 exposure
+# settings survive.
+FAILED_EXPERIMENTS = (
+    "DUMM_alkA_chpS_111325",             # alkA (9 trenches) + chpS (15)
+    "DUMM_baeS_gfcE_112025",             # gfcE (7) only -- no baeS data despite the name
+    "DUMM_giTG068_059__lactose_062025",  # lacZ (4) + hupA (1)
+)
+
 
 def exposure_for(experiment_name):
     """Return (phase_ms, fluor_ms) for an experiment, or (None, None) if unknown."""
