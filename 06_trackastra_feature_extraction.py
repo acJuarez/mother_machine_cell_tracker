@@ -84,7 +84,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--trackastra-dir', required=True, type=str,
         help='Directory holding trackastra output files '
-             '(*_ctc_masks_*.npy, *_napari_tracks_graph_*.json, *_imgs_*.npy).'
+             '(*_ctc_masks_*.npy, *_ctc_tracks_*.csv, *_imgs_*.npy).'
     )
     parser.add_argument(
         '--time-range-dict', required=False, type=str, default='',
