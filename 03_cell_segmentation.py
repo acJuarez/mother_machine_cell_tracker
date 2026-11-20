@@ -127,7 +127,7 @@ def run_cell_segmentation(base_dir, exp_dict_json, start_frame, end_frame,
 
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser(
-		description="Stage 3: Cell segmentation using highly tunable parameters for cell_segmentation."
+		description="Stage 3: Cell segmentation using highly tunable parameters."
 	)
 
 	# --- Mandatory I/O Argument ---
