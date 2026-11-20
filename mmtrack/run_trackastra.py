@@ -1,37 +1,43 @@
-import torch
-import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-import pandas as pd
-from trackastra.model import Trackastra
-from trackastra.tracking import graph_to_ctc, graph_to_napari_tracks, write_to_geff
-from trackastra.data import example_data_bacteria
-import tifffile
-import napari
-import json
-import pandas as np
-import numpy as np
+"""Stage 4: Trackastra lineage tracking, one trench at a time.
+
+Tracks the hand-corrected masks from stage 3b against the phase stack and writes, per
+trench, into `output_dir`:
+
+    {exp}_ctc_tracks_{fov}_{peak}.csv          label, t1, t2, parent -- the lineage
+    {exp}_ctc_masks_{fov}_{peak}.npy           relabelled tracked masks
+    {exp}_imgs_{fov}_{peak}.npy                the trimmed phase stack
+    {exp}_napari_tracks_{fov}_{peak}.npy       display only
+    {exp}_napari_tracks_graph_{fov}_{peak}.json
+
+STAGE 3B IS MANDATORY. The input mask is `napari_corrections/{fov}_{peak}_corrected.tif`,
+not the raw `mm3_segmented_*.tif`. A trench with no corrected mask is skipped with a
+warning, so a missing 3b pass shows up as absent output, never as an error.
+
+The stack is trimmed to `[start:end]` before tracking, and `end` defaults to T-1, so the
+last frame is dropped. Stage 5 must be given the SAME time_range_dict: it re-slices the
+fluorescence TIFF with those indices while taking phase from the already-trimmed
+`imgs.npy`, and a mismatched `start` silently pairs each mask with the wrong frame.
+"""
 import argparse
+import json
+import os
+import tempfile
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import numpy as np
+import tifffile
+
+DEFAULT_OUTPUT_DIR = ('/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/'
+                      'track_test/track_astra_output')
+MODEL_NAME = "general_2d_w_SAM2_features"
 
 
 def get_tiff_frame_count(file_path):
-    """
-    Reads a TIFF file using imread and returns the index of the last time frame (T - 1).
-    NOTE: This loads the entire file into memory.
-    """
+    """Index of the last time frame (T-1), or 0 if the file cannot be read."""
     try:
-        # Load the entire image stack into memory
-        img_stack = tifffile.imread(file_path)
-
-        shape = img_stack.shape
-
-        # Assume the time axis (T) is the first dimension
-        if len(shape) >= 3:
-            # The last index is T - 1
-            return shape[0] - 1
-        else:
-            # Single 2D image
-            return 0
-
+        shape = tifffile.imread(file_path).shape
+        return shape[0] - 1 if len(shape) >= 3 else 0
     except FileNotFoundError:
         print(f"Error: TIFF file not found at {file_path}")
         return 0
@@ -39,105 +45,81 @@ def get_tiff_frame_count(file_path):
         print(f"Error reading TIFF file {file_path}: {e}")
         return 0
 
-def plot_trackastra_kymograph(imgs, ctc_masks, napari_tracks, napari_tracks_graph):
-    kymo_imgs = imgs.transpose(1, 0, 2).reshape(382, -1)  # (382, 1800)
-    kymo_masks = ctc_masks.transpose(1, 0, 2).reshape(382, -1)
 
-    kymo_tracks = napari_tracks.copy()
-    new_x = napari_tracks[:, 1] * 20 + napari_tracks[:, 3]
-    kymo_tracks = np.column_stack([
-        napari_tracks[:, 0],  # track_id
-        np.zeros(len(napari_tracks)),  # dummy time (all in same frame)
-        napari_tracks[:, 2],  # y stays the same
-        new_x  # new x position
-    ])
+def run_trackastra(base_path, time_range_dict, output_dir=DEFAULT_OUTPUT_DIR,
+                   phase_c='0', device="automatic"):
+    """Track every (experiment, FOV, trench) named in `time_range_dict`.
 
-def run_track_astra(base_path, time_range_dict):
-    # time_dict ='{"DUMM_giTG060_064_121425":{"000":{"1343":{"start": 62, "end": null}}}}'
-    time_range_dict = json.loads(time_range_dict)
-    print(len(time_range_dict))
-    
-    phase_c_str = '0'
-    fluor_c_str = '1'
-    
-    device = "automatic" 
-    model = Trackastra.from_pretrained("general_2d_w_SAM2_features", device=device)
+    `time_range_dict` is a JSON string or a dict:
+        {"Exp_name": {"FOV": {"Peak_ID": {"start": 62, "end": null}}}}
+    """
+    from trackastra.model import Trackastra
+    from trackastra.tracking import graph_to_ctc, graph_to_napari_tracks
 
-    for folder, fov_dict in time_range_dict.items():    
-        for fov_id in fov_dict.keys():
-            trench_time_ranges = fov_dict[fov_id]
+    if isinstance(time_range_dict, str):
+        time_range_dict = json.loads(time_range_dict)
+    os.makedirs(output_dir, exist_ok=True)
+    model = Trackastra.from_pretrained(MODEL_NAME, device=device)
+
+    for folder, fov_dict in time_range_dict.items():
+        for fov_id, trench_time_ranges in fov_dict.items():
             print(f"  FOV: {fov_id}, Trenches: {list(trench_time_ranges.keys())}")
-    
+
             for peak_id, time_info in trench_time_ranges.items():
-                base_file_path = os.path.join(base_path, folder, 'hyperstacked', 'drift_corrected', 'rotated',
-                                                'mm_channels', 'subtracted')
-                path_to_phase_stack = os.path.join(base_file_path,
-                                                    f'subtracted_FOV_{fov_id}_region_{peak_id}_c_{phase_c_str}.tif')
-                path_to_labeled_stack = os.path.join(base_file_path,
-                                                        f'mm3_segmented_subtracted_FOV_{fov_id}_region_{peak_id}_c_{phase_c_str}.tif')
-                path_to_fluor_stack = os.path.join(base_file_path,
-                                                    f'subtracted_FOV_{fov_id}_region_{peak_id}_c_{fluor_c_str}.tif')
-                # --- Dynamic Time Range Assignment ---
+                subtracted = os.path.join(base_path, folder, 'hyperstacked',
+                                          'drift_corrected', 'rotated', 'mm_channels',
+                                          'subtracted')
+                path_phase = os.path.join(
+                    subtracted, f'subtracted_FOV_{fov_id}_region_{peak_id}_c_{phase_c}.tif')
+                path_labeled = os.path.join(
+                    subtracted, 'napari_corrections', f'{fov_id}_{peak_id}_corrected.tif')
+
                 start = time_info['start']
-                end = time_info.get('end') 
-            
-                
+                end = time_info.get('end')
                 if end is None:
-                    # Calculate end frame dynamically using the Phase stack file
-                    end = get_tiff_frame_count(path_to_phase_stack)
+                    end = get_tiff_frame_count(path_phase)
                     if end == 0:
-                        print(f"    WARNING: Could not determine frame count for {peak_id}. Skipping.")
+                        print(f"    WARNING: no frame count for {peak_id}. Skipping.")
                         continue
-    
-                # 2. Read Image Stacks
+
                 try:
-                    stack_phase = tifffile.imread(path_to_phase_stack)
-                    stack_labeled = tifffile.imread(path_to_labeled_stack)
-                    stack_fluor = tifffile.imread(path_to_fluor_stack)
+                    stack_phase = tifffile.imread(path_phase)
+                    stack_labeled = tifffile.imread(path_labeled)
                 except FileNotFoundError as e:
-                    print(f"    WARNING: Required file not found for {peak_id}: {e}. Skipping.")
+                    print(f"    WARNING: required file not found for {peak_id}: {e}. "
+                          f"Skipping (has stage 3b run on this trench?).")
                     continue
-                # here is where I need to incorporate start and end
-                print(peak_id)
-                print(start)
-                print(end) 
-                stack_phase_trimmed = stack_phase[start:end, :, :].copy()
-                stack_labeled_trimmed = stack_labeled[start:end, :, :].copy()   
-                track_graph, masks_tracked = model.track(stack_phase_trimmed, stack_labeled_trimmed, mode="ilp")
-                ctc_tracks, ctc_masks = graph_to_ctc(
-                    track_graph, masks_tracked, outdir=f'test_040726')
-                
-                napari_tracks, napari_tracks_graph, _ = graph_to_napari_tracks(track_graph)
-    
-                np.save(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_ctc_masks_{fov_id}_{peak_id}.npy', ctc_masks)
-                np.save(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_imgs_{fov_id}_{peak_id}.npy', stack_phase_trimmed)
-                np.save(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_napari_tracks_{fov_id}_{peak_id}.npy', napari_tracks)
-    
-                with open(f'/oak/stanford/groups/mcovert/Instruments/Covert-lab-scope1/track_test/track_astra_output/{folder}_napari_tracks_graph_{fov_id}_{peak_id}.json', "w") as f:
-                    json.dump(napari_tracks_graph, f)
+
+                print(f"{peak_id} start: {start} end: {end}")
+                phase = stack_phase[start:end, :, :].copy()
+                labeled = stack_labeled[start:end, :, :].copy()
+                track_graph, masks_tracked = model.track(phase, labeled, mode="ilp")
+
+                # graph_to_ctc insists on writing a CTC directory; it is not an output of
+                # this stage, so it goes to a temp dir that disappears.
+                with tempfile.TemporaryDirectory() as tmp:
+                    ctc_tracks, ctc_masks = graph_to_ctc(track_graph, masks_tracked,
+                                                         outdir=tmp)
+                napari_tracks, napari_graph, _ = graph_to_napari_tracks(track_graph)
+
+                stem = os.path.join(output_dir, f'{folder}_{{}}_{fov_id}_{peak_id}')
+                ctc_tracks.to_csv(stem.format('ctc_tracks') + '.csv')
+                np.save(stem.format('ctc_masks') + '.npy', ctc_masks)
+                np.save(stem.format('imgs') + '.npy', phase)
+                np.save(stem.format('napari_tracks') + '.npy', napari_tracks)
+                with open(stem.format('napari_tracks_graph') + '.json', 'w') as f:
+                    json.dump(napari_graph, f)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="trackastra tracking algorithm"
-    )
-
-    parser.add_argument(
-        'base-path',
-        required=True,
-        type=str,
-        help="path to directory containing all microscopy experiments"
-    )
-
-    parser.add_argument(
-        'time-range-dict',
-        required=False,
-        type=str,
-        default='',
-        help='JSON string defining start/end time frames to trip image before applying trackastra. Format is: '
-             '{"Exp_name":{"FOV":{"Peak_ID":{"start": 62, "end": null}}}}'
-    )
-    
+    parser = argparse.ArgumentParser(description="trackastra tracking algorithm")
+    parser.add_argument('--base-path', required=True, type=str,
+                        help="path to directory containing all microscopy experiments")
+    parser.add_argument('--time-range-dict', required=True, type=str,
+                        help='JSON string defining start/end frames per trench. Format: '
+                             '{"Exp_name":{"FOV":{"Peak_ID":{"start": 62, "end": null}}}}')
+    parser.add_argument('--output-dir', type=str, default=DEFAULT_OUTPUT_DIR,
+                        help=f'Where to write the per-trench outputs. '
+                             f'Default: {DEFAULT_OUTPUT_DIR}')
     args = parser.parse_args()
-    
-    run_track_astra(args.base_path, args.time_range_dict)
+    run_trackastra(args.base_path, args.time_range_dict, args.output_dir)

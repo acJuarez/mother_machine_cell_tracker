@@ -15,6 +15,6 @@ BASE_PATH=$1
 TIME_RANGE_DICT=$2
 
 apptainer exec /home/users/aj0204/Docker/trackastra_v2.sif \
-    python /home/users/aj0204/repos/mother_machine_cell_tracker/mmtrack/run_trackastra_sherlock.py \
+    python /home/users/aj0204/repos/mother_machine_cell_tracker/04_trackastra_tracking.py \
     --base-path "$BASE_PATH" \
     --time-range-dict "$TIME_RANGE_DICT"

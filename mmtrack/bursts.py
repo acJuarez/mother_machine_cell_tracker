@@ -1,527 +1,325 @@
-"""Burst detection: the versioned definitions, the detector, and the audit tools.
+"""Burst detection: the three definitions (v1, v2, v3), the hand labels, and the build.
 
-This code used to live only in cells 55/56/75 of
-``notebooks/analysis_notebooks/trackastra_figures_082026.ipynb``, which is closed. That made
-the shipped ``data/bursts_082026.csv`` unreproducible from the current summary notebook and
-made every definition change a copy-paste. It is hoisted here unchanged in behaviour: the
-regression test is that :func:`run_burst_detection_any` returns exactly **73 / 89 / 89**
-events for v1 / v2 / v3, set-identical to the ``burst_v1/v2/v3`` columns of that CSV.
+V1 = hand built rule with four different routes, incomplete and both missed and overclassified bursts that were not bursts 
+V2 = a gradient boosted classifier trained from 2 subgen and 1 constitutive gene of data 
+V3 = a monotone gradient-boosted classifier from annotated data of every kymograph availble excluding mazF and hupA
+manual = manually annotated bursts used for training and validation 
 
-**The primitives are imported, not re-copied.** ``compute_baselines``,
-``trench_max_envelope`` and ``lineage_family_roots`` already existed in :mod:`mmtrack.figures`,
-byte-identical to the notebook's copies. They are imported from there so there is one
-implementation rather than three. (``build_lineage_traces`` lives there too, but detection runs
-on the max envelope, so only the plots use it.)
+v1's height bar is a (gene, experiment) median + MAD, so it is NOT local: after an exclusion v1 must be re-run, never filtered.
 
-Import direction is one-way: this module imports :mod:`mmtrack.figures`, never the reverse.
-``figures`` reaches the definition dicts through a module-level ``__getattr__`` so
-``figures.BURST_DEF`` keeps working without an import cycle.
+Every statistic in v2 and v3 is computed inside one kymograph, so excluding a trench changes
+no other trench's result. 
 
-What a burst is
----------------
-A frame on a max-fluorescence envelope is a burst when it (1) clears
-``median + k * mad_scale`` for its (gene, experiment), (2) is the maximum within +/-``window``
-frames, and (3) has topographic **prominence** >= ``k_prom * mad_scale``. Prominence is the
-load-bearing criterion: a flat-high constitutive trace clears any height bar but has
-prominence ~0, which is what keeps hupA and mazF at zero. Do not replace it with a one-sided
-or ``min``-based rise -- measured, both score hupA's brightest wobble at 6.855 MAD-scales,
-*above* a real chpS burst at 6.061, so both invert the control. **That applies to the
-prominence in MAD units and only to it**; the unit-free ratio does not invert, which is what
-v6 relies on.
-
-From **v5** there is a second, OR'd route in: a peak whose ``peak / max(left_base,
-right_base)`` reaches ``fold_prom`` qualifies even when it never clears the height bar. That
-exists because the height bar is absolute-within-gene, so a trench sitting below its gene's
-median can never register a burst however large the excursion inside it -- 146 of 255 trenches
-are in that position. The ratio is unit-free, and a flat-high constitutive trace scores ~1.0,
-which is why it does not cost the control. Every event carries ``route``.
-
-From **v6** there is a third: the same ratio taken against the ``left_base`` alone, with the
-denominator floored at ``fold_base_floor_frac * median``. ``max(left, right)`` binds on the
-right whenever a burst's decay has not returned to its pre-burst floor -- the normal case,
-since the decay is dilution by growth rather than protein loss -- so the max-base rule
-systematically penalises long-decay events. v6 is a strict superset of v5: 99 absolute + 19
-fold + 38 fold-left = **156**, with hupA and mazF still at zero.
-
-Then an **episode merge** collapses a slow decay to one event, and (v2 onward) a
-**concurrent merge** collapses one burst seen in two adjacent lineage families.
-
-Units
------
-``fluor_col`` defaults to ``fluor_per_ms`` (a.u./ms). Detection is invariant under the
-exposure rescale: baselines are per (gene, experiment) and exposure is constant within an
-experiment, so median, MAD, height and prominence all scale by the same 1/E.
 """
 
 import itertools
+import json
+import os
+import re
 
 import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks, peak_prominences
 
-from mmtrack.figures import (
-    FLUOR_COL, KYMO_KEY,
-    compute_baselines, lineage_family_roots, trench_max_envelope,
-)
+from mmtrack.experiment_metadata import FAILED_KYMOGRAPHS, STRAIN_EXP_DICT
 
-__all__ = [
-    'BURST_DEF', 'BURST_DEF_V1', 'BURST_DEF_V2', 'BURST_DEF_V3', 'BURST_DEF_V4',
-    'BURST_DEF_V5', 'BURST_DEF_V6',
-    'BURST_DEF_V7', 'BURST_DEFS', 'ROUTE_RANK', 'FAMILY_SEP', 'MIN_CELL_AREA_FRAC',
-    'attach_kymograph_fence',
-    'detect_bursts', 'add_lineage_family', 'add_spatial_subgroup',
-    'merge_concurrent_bursts', 'run_burst_detection_any', 'drop_degenerate_masks',
-    'build_burst_csv', 'burst_candidates', 'detect_sustained_rises',
-    'add_relative_y', 'attach_kymograph_baselines', 'burst_coverage', 'prom_multiplier',
-    'BURST_DEF_V11', 'attach_lit_baseline', 'detect_bursts_seeded',
-]
+# one kymograph
+KYMO_KEY = ['experiment_name', 'FOV', 'trench_id']       
 
-# ---------------------------------------------------------------------------------------
-# Versioned definitions -- append only
+#one cell frame 
+FRAME_KEY = KYMO_KEY + ['track_id', 'time_frame']        
+# columns for image signal 
+FLUOR_COL = 'fluor_per_ms'                               
+F_RAW = 'intensity_mean_fluor'                          
+
+# predicted lineage read in format of 1 , 1.1, 3.1.1 where each decimal is a daughter of cell the prior 
+# FOV written in format of 00X and trenc_ids are just a numeric value 
+
+READ_DTYPES = {'experiment_name': str, 'FOV': str, 'trench_id': str,
+               'gene': str, 'predicted_lineage': str}
+
+# file inputs
+# all_data_annotated* = one row is a single cell within a single frame for all 23 experiments
+# fiji_fluor_nospeckle = same as above but with FIHI clip + median filter, used by V2 and V3 
+# annotated_bursts = all manually annotated bursts, frame number uses the viewer index
+# time_dict = description of start and end for each kymograph 
 #
-# Add a new dict and repoint BURST_DEF; never edit an old one in place. Every output frame
-# carries `def_version` so a saved result traces back to the rule that produced it. The
-# narrative changelog lives in the summary notebook.
-# ---------------------------------------------------------------------------------------
-
-FAMILY_SEP = '#'          # encodes the partition into trench_id so detect_bursts groups by it
-
-BURST_DEF_V1 = {
-    'version': 'v1',
-    'k': 4.0,                       # MAD multiplier for the HEIGHT threshold
-    'k_prom': None,                 # required prominence multiplier; None -> fall back to k
-    'window': 5,                    # +/- frames for the local-max check / peak separation
-    'min_prominence': None,         # absolute override; None -> k_prom * mad_scale
-    'fluor_col': FLUOR_COL,
-    'signal': 'per-trench max envelope',
-    'baseline_keys': ('gene', 'experiment_name'),
-    'constitutive_genes': ('mazF', 'hupA', 'chpS'),
+INPUTS = {
+    'cells': 'data/all_data_annotated_082026.csv',
+    'fiji': 'data/fiji_fluor_nospeckle_090926.csv',
+    'labels': 'data/annotated_bursts_100226.csv',
+    'time_dict': 'data/time_dict_082026.json',
+    'v2_model': 'models/burst_classifier_091026.joblib',
 }
+CELLS_CSV = INPUTS['cells']
+TIME_DICT_JSON = INPUTS['time_dict']
 
-# v2 detects on per-LINEAGE-FAMILY envelopes so two bursts running at once in one trench are
-# not masked by whichever is brighter, then merges concurrent adjacent events back together.
-BURST_DEF_V2 = {
-    **BURST_DEF_V1,
-    'version': 'v2',
-    'signal': 'per-lineage-family max envelope',
-    'merge_window': 5,                 # frames; peaks this close together are concurrent
-    'merge_gap_cell_lengths': 1.5,     # centroid gap below this = one burst, not two
-    'merge_keep': 'earliest',          # report burst onset, not the brighter neighbour
+OUTPUTS = {
+    'v1': 'bursts_v1_100226.csv',
+    'v2': 'bursts_v2_100226.csv',
+    'v3': 'bursts_v3_100226.csv',
+    'manual': 'bursts_manual_100226.csv',
+    'unresolved_labels': 'burst_labels_recheck_100226.csv',
+    'splits': 'burst_splits_100226.csv',
+    'union': 'bursts_viewer_v1v2v3manual_100226.csv',
+    'v3_model': 'burst_v3_100226.joblib',
 }
+BURSTS_CSV = os.path.join('data', OUTPUTS['union'])
 
-# v3 subdivides a lineage family that is spatially discontiguous. Measured: a no-op on this
-# dataset (identical 89 events to v2), because identity-based linking re-joins whatever a
-# position split separates -- cells in a trench are physically contiguous.
-BURST_DEF_V3 = {
-    **BURST_DEF_V2,
-    'version': 'v3',
-    'signal': 'per-lineage-family x spatial-cluster max envelope',
-    'split_gap_cell_lengths': 1.5,   # cut a family where its cells are this far apart in y
-}
+EXPECTED = {'cells': 78931, 'trenches': 243, 'v1': 158, 'v2': 1041, 'v3': 1065,
+            'manual': 837, 'unresolved_labels': 19, 'union': 1732,
+            'v1_routes': {'absolute': 97, 'fold_left': 36, 'fold': 18, 'tukey': 7}}
 
-# v4 decouples the two uses of k. In v1-v3 one k set the height bar AND the required
-# prominence, and they had never been tested apart. Measured on the 20-experiment frame:
-# lowering only the prominence bar has a plateau at k_prom in [3.6, 3.8] that catches genuine
-# near-misses while leaving hupA and mazF at exactly 0.00 (hupA's best candidate is 3.586, so
-# 3.5 is where the control breaks). 3.7 is the middle of that plateau. 89 -> 99 events.
-BURST_DEF_V4 = {
-    **BURST_DEF_V3,
-    'version': 'v4',
-    'k': 4.0,            # height bar only, from here on
-    'k_prom': 3.7,
-}
-
-# v5 adds a second ROUTE rather than moving a bar. v1-v4 gate on absolute brightness -- a peak
-# must clear median + k*s -- so a trench whose whole envelope sits below its gene's median can
-# never register a burst however dramatic the excursion inside it is. Measured, 146 of 255
-# trenches are in that position, and 36 of them contain a >= 2.5x internal fold rise: gldA 42%
-# of its trenches, gfcE 27%, alkA 17%. `fold_prom` catches those on a unit-free ratio.
-#
-# 3.3 is the midpoint of the window that admits the motivating case (3.60x) while excluding
-# every constitutive gene's best candidate (hupA 1.76x, mazF 2.94x, chpS 3.10x). That ~7%
-# guard band on each side is the honest limit of the criterion -- quote it with the number.
-BURST_DEF_V5 = {
-    **BURST_DEF_V4,
-    'version': 'v5',
-    'fold_prom': 3.3,
-    'fold_height_floor_s': 1.0,
-}
-
-# v6 changes which BASE the fold ratio divides by, and adds that as a third route rather
-# than altering v5's. `fold` uses max(left_base, right_base); that max binds on the RIGHT
-# whenever a burst's decay does not return to its pre-burst floor -- which is the normal case
-# here, because the decay is dilution by growth, not protein loss (see the module docstring
-# and bursts.md section 1). So max-base systematically penalises exactly the long-decay
-# events. Anchoring on the left base asks "did it rise from where it was?", which is the
-# question a burst poses, and a flat-high trace still scores ~1.0, so the constitutive
-# control survives.
-#
-# This is NOT the left-base variant that bursts.md section 4 rejects. That measurement was on
-# ABSOLUTE prominence in MAD units, where left-only inverted the control (hupA's best wobble
-# 6.855 vs a real chpS burst 6.061). As a unit-free RATIO it does not invert: hupA tops out at
-# 3.372 and the motivating case reaches 3.787.
-#
-# `fold_base_floor_frac` is load-bearing. Unfloored, a near-zero left base manufactures an
-# arbitrary ratio -- chpS 010/46 has left_base 0.006 and scores 30.0x. Flooring the
-# denominator at 0.5 * the gene-experiment median takes the controls to hupA/mazF 3.372 and
-# chpS 4.22 while leaving the motivating case untouched at 3.787.
-#
-# 3.6 sits mid-plateau: hupA and mazF stay at zero candidates for every bar >= 3.4, and the
-# motivating case is lost above 3.79. Band [3.4, 3.79], ~5% each side -- narrower than v5's,
-# and its upper edge is set by a SINGLE event. Quote the band with the number.
-BURST_DEF_V6 = {
-    **BURST_DEF_V5,
-    'version': 'v6',
-    'fold_left_prom': 3.6,
-    'fold_base_floor_frac': 0.5,
-}
-
-# v7 adds a fourth route on a completely different statistic: the trench's own Tukey fence,
-# `Q3 + iqr_k*IQR` over its cell-frame distribution. Every route up to here is a location+scale
-# statement about the (gene, experiment) baseline -- height, or a ratio against a peak's own
-# flanks. A quartile fence is a SHAPE statement about one trench, and measured on cell-frames it
-# reaches both documented near-misses that no height bar reaches at any scope (gfcE 013/153
-# frame 31, alkA 001/1192 frame 9) while ranking hupA/mazF 8th/7th of 10 by flagged fraction.
-#
-# THE MULTIPLIER IS 4.0, NOT THE TEXTBOOK 1.5. Measured sweep (events / added over v6's 156 /
-# control-gene events), all strict supersets of v6 with zero losses:
-#
-#   iqr_k  events  added   hupA  mazF  chpS   regression trenches
-#     1.5     523   +367      5    16    43   BROKEN
-#     2.5     247    +91      2     3     9   BROKEN
-#     3.0     196    +40      2     2     7   BROKEN
-#     3.4     175    +19      2     1     6   ok
-#     4.0     164     +8      1     0     5   ok      <- shipped
-#     4.4     160     +4      0     0     5   ok      <- control-clean
-#     4.8     159     +3      0     0     5   ok
-#     5.0     156     +0      0     0     5   ok      (adds nothing = v6)
-#
-# Read that table honestly, because it says something the earlier routes did not have to admit:
-# **there is no multiplier at which this route both adds events and leaves the constitutive
-# control untouched by more than a hair.** At 1.5 it is not close -- mazF alone takes 16 events
-# and all three regression trenches break. The control-clean band is [4.4, 4.8], and it buys
-# only 4 events.
-#
-# 4.0 is shipped as a deliberate call, not a plateau midpoint: it doubles the yield to +8 at a
-# cost of exactly ONE hupA event (hupA 012/1165 frame 81), on the argument that a constitutive
-# gene can still burst and a hard zero is a convention rather than a law. Set
-# `tukey_iqr_k=4.4` for the control-clean variant. Note what that one event is, because it is
-# the textbook failure mode: fluor 7.73 against a gene bar of 6.17, so it is BRIGHT but not
-# prominent -- Denver, in bursts.md section 4's terms. The fence cannot see a rise, and this is
-# what that costs.
-#
-# At 4.0: gfcE 013/153 keeps route='fold_left' and alkA 001/1192 keeps route='fold', so v7
-# relabels nothing v6 found. chpS and mazF are unchanged from v6 entirely.
-BURST_DEF_V7 = {
-    **BURST_DEF_V6,
-    'version': 'v7',
-    'tukey_iqr_k': 4.0,
-}
-
-# v8 -- NOT SHIPPED. A tested and REJECTED definition, kept so the negative result is not
-# re-derived. It is deliberately absent from the viewer's BURST_VERSIONS and from
-# figures.VERSION_COLOR, and no event CSV was written for it.
-#
-# MEASURED FAILURE: swept fiji_fold {2,3,4,6,10} x fiji_base_floor_frac {0.05..0.30} x
-# fiji_max_activity {0.02,0.05,0.10,0.15} over both fiji_mean and fiji_max -- 34 settings --
-# and NONE is both constitutive-clean and able to find the three regression trenches. The
-# tradeoff is structural, not a tuning problem:
-#   * every setting that finds 3/3 regression trenches admits 9-17 mazF events;
-#   * every setting that holds mazF at 0 finds at most 1 of the 3;
-#   * v6 recall peaks at 54.5%, so v8 is NOT a superset of v6 -- it misses half of v6's 156
-#     events while adding hundreds of new ones. Each version being a strict superset of the
-#     last is what makes the definitions comparable at all, and this breaks it.
-#
-# WHY, diagnosed: on the three regression trenches the fiji envelope maxima are 2.06, 0.73
-# and 6.48 counts against display spans of 29, 22 and 25. `fiji_mean` averages over the WHOLE
-# cell, so a burst lighting part of a cell is diluted to a couple of counts, and any
-# denominator floor expressed as a fraction of the display span (a per-PIXEL range) is the
-# same size as the peak itself -- dimensionally inconsistent, and the ratio can never reach
-# the bar. `fiji_max` avoids the dilution and does reach 3/3, but only at floors loose enough
-# to let mazF through.
-#
-# WHAT IS STILL GOOD, and why the values were kept: within a trench the signal ranks bursts
-# almost perfectly -- 21/21 sampled v6 events are nonzero at a median percentile rank of
-# 0.993. The measurement is informative; it is the absolute-threshold rule built on it that
-# fails. A rank- or envelope-relative rule (peak as a fraction of the trench's OWN fiji max,
-# rather than of the display span) is the untried direction.
-#
-# The per-cell values live in data/fiji_fluor_082026.csv via
-# track_displacement.compute_fiji_fluor, verified bit-identical to the viewer's layer.
-
-# v8 -- detection on the FIJI-TRANSFORMED images, a different measurement rather than a
-# different rule on the same one. `fluor_col` is fiji_mean from
-# track_displacement.compute_fiji_fluor: per-cell mean of (clip at 0.25*trench max ->
-# ImageJ median r2 on the assembled kymograph -> small-object removal).
-#
-# It does NOT reuse the v1-v7 routes, and cannot. Those all lean on the (gene, experiment)
-# median + MAD, and this column is ~99% zeros, so that baseline collapses: measured, three
-# of four gene-experiment groups give median 0 and mad_scale 1e-6 (the clip floor), i.e.
-# height ~ 4e-6, where every nonzero blip clears the bar. The fold routes fail the other
-# way (`base > 0` and `den_floor = 0.5*med` both go to zero) and a Tukey fence degenerates
-# identically (Q3 = IQR = 0). So v8 runs its own detector, `detect_bursts_fiji`, and
-# detect_bursts is untouched -- which is also what keeps the frozen v1/v2/v3 event sets safe.
-#
-# `k`/`k_prom`/`min_prominence` are kept only so the dict stays shape-compatible with the
-# hard-indexed keys in run_burst_detection_any; the fiji detector ignores them.
-BURST_DEF_V8 = {
-    **BURST_DEF_V7,
-    'version': 'v8',
-    'fluor_col': 'fiji_mean',
-    'tukey_iqr_k': None,           # no fence: Q3 and IQR of a mostly-zero column are 0
-    'fiji_floor': 0.0,             # a candidate must clear its trench's own display floor
-    'fiji_fold': 3.0,              # peak / floored left base: unit-free, replaces MAD prominence
-    'fiji_base_floor_frac': 0.05,  # floor the denominator at this fraction of the display
-                                   # span; an eps-only floor makes the ratio inert
-    'fiji_max_activity': 0.05,     # reject a trench whose MEDIAN cell already sits this high
-                                   # above its floor (as a fraction of the display span) --
-                                   # that is a constitutive trace, not a burst. Swept.
-}
-
-# v9 -- SUPERSEDED BY v10, kept for provenance and still runnable. Any-signal detection with
-# (time, y) deduplication; v10 replaced it because a sharp-RISE rule on the same values agrees
-# with v6 at the frame level far better (91 of 156 exact rows vs 16), v9 reporting burst onset
-# where v6 reports the peak. v9 is still the better CONTROL performer (mazF 9 vs 13, and a
-# wider hupA-clean band), so it is worth re-running rather than deleting.
-#
-# v9 -- ANY-SIGNAL detection on the FIJI-transformed values, deduplicated in (time, y).
-#
-# The rule shape v8 should have been. The transform has already done the thresholding: clip
-# at 25% of the trench's own max, ImageJ median r2 on the assembled kymograph, drop sub-10px
-# components. Whatever survives IS the candidate set, so there is no baseline, no MAD height,
-# no prominence and no fold ratio -- the three things that all collapse on a ~99%-zero column
-# and sank v8.
-#
-# A candidate is any cell-frame with a nonzero value. That needs no choice of statistic:
-# fiji_mean > 0, fiji_max > 0 and fiji_frac > 0 are the IDENTICAL set of 32,979 cell-frames,
-# verified, because all three read the same above-floor pixels.
-#
-# Deduplication is spatial-temporal connected components, not the concurrent merge: link two
-# lit cell-frames when |dt| <= link_dt and |dy| <= link_dy_cell_lengths * median cell length
-# * |dt|, then each component is one event. The |dt| scaling is not cosmetic -- a track
-# drifts -4.7 px/frame (median, -17 at p10), so a fixed tolerance fragments any advecting
-# burst. The cell length is the TRENCH's own median axis_major_length, which keeps the
-# tolerance scale-free for the ~1/3 linear scale DUMM_giTG66_Glucose_012325.
-#
-# `lit_gate` is mandatory, and it is what the per-trench floor makes it. Because the floor is
-# 25% of each trench's OWN max, a uniformly bright trench lights up entirely: hupA is 99.9%
-# lit across all 6 of its trenches and mazF 85.1%, against araB 4.9% and lacZ 13.6%. The lit
-# fraction runs INVERSELY to burstiness, so rejecting trenches above 60% lit takes hupA to
-# exactly zero. It is not free: v6 coverage drops 96% -> 76% because some >60%-lit trenches
-# hold real v6 events, and chpS falls to 4 despite being a known burster.
-#
-# `lit_gate` is 0.90, RAISED from 0.60 on 090926 when small-object removal was turned off.
-# Dropping that step raises the lit fraction (40.3% -> 48.9% of cell-frames, and 86 -> 117 of
-# 255 trenches above 60% lit), so a gate tuned on the speckled distribution rejected too much
-# -- murQ, the top gene by rate, went from 0 of 4 sampled trenches rejected to 3 of 4.
-#
-# 0.90 dominates rather than trades. Swept 0.60/0.70/0.80/0.90: hupA is 0 at EVERY value (it
-# cannot break until 0.994, its own minimum lit fraction) and mazF is FLAT at 9 from 0.70 up,
-# because mazF's lit fractions jump from 0.31 straight to 0.98+ so the same single low-lit
-# trench is the only one admitted anywhere in that range. Raising the gate therefore costs
-# nothing on the controls, and buys chpS 6 -> 16 (a known burster the 0.60 gate cut to 4) and
-# v6 coverage 78% -> 96%.
-#
-# Measured at the shipped settings: 802 events over 208 of 255 trenches, 3/3 regression
-# trenches, hupA 0, mazF 9, v6 coverage 96%. The previous with-speckle settings
-# (min_size=10, lit_gate=0.60) gave 671 events / 145 trenches / hupA 0 / mazF 11 / 76%, and
-# are reproducible from data/fiji_fluor_082026.csv + data/bursts_v9_090826.csv. Event duration median 3 frames, p90 20,
-# max 87 -- treat the top end as unreliable, it is an over-merged lit trench rather than a
-# burst. 265 events (39%) are single cell-frames; `min_cell_frames` filters them and ships
-# at 1 (keep), because whether a one-frame excursion is an event is a biological call.
-BURST_DEF_V9 = {
-    **BURST_DEF_V8,
-    'version': 'v9',
-    'signal': 'per-trench lit cluster',   # startswith('per-trench') -> no family partition
-    'fluor_col': 'fiji_mean',
-    'fiji_fold': None,                    # no ratio route; the transform IS the threshold
-    'lit_gate': 0.90,
-    'link_dt': 2,
-    'link_dy_cell_lengths': 1.5,
-    'min_cell_frames': 1,
-}
-
-# v10 -- SUPERSEDES v9 as the definition on the FIJI-transformed values.
-#
-# v9 asked "is anything lit at all"; v10 asks "is there a sharp RISE", which is what the
-# filtered mean-fluorescence traces actually show. It is burst v5's rule shape verbatim --
-# same per-lineage-family x spatial-cluster max envelope, same +/-5 frame window, same
-# episode merge -- with ONE substitution: the baseline. See attach_fiji_scale for why the
-# (gene, experiment) median + MAD cannot be used on this column, and why the trench's own
-# brightest cell-mean is the right scale. `k` and `k_prom` are therefore FRACTIONS, not MAD
-# multipliers, which is why they look nothing like v5's 4.0 / 3.7.
-#
-# `fold_prom` is off: the fold route needs `max(left_base, right_base) > 0` and these traces
-# rise from exactly 0, so it is inert here (measured: identical event sets with and without).
-#
-# Measured at the shipped settings: 352 events, 3/3 regression trenches, hupA 0, mazF 13,
-# chpS 35, and 91 of 156 v6 events matched at the EXACT frame -- against v9's 16, because
-# keeping v5's envelope-and-peak machinery means it reports the same representative frames
-# v6 does.
-#
-# CAVEAT, stated because it is narrower than v9's: hupA is 0 only for k >= 0.60 at
-# k_prom = 0.40 (two points tested in that band, not a fine grid), and mazF/chpS are not
-# zero. v10 wins on frame-level agreement with v6, not on control cleanliness. v9 remains
-# reproducible from data/bursts_v9_nospeckle_090926.csv.
-BURST_DEF_V10 = {
-    **BURST_DEF_V5,
-    'version': 'v10',
-    'fluor_col': 'fiji_mean',
-    'k': 0.60,          # peak >= 0.60 x this trench's brightest cell-mean
-    'k_prom': 0.40,     # and rises by >= 0.40 x it  <- the "sharp increase"
-    'fold_prom': None,  # inert on this column: bases are 0
-}
-
-# v11 -- seed on the trench's own LIT distribution, cluster in (t, y), report the peak.
-#
-# The problem v11 exists for, measured on the shipped sets: v10's bar is 0.60 x the trench's
-# single brightest cell-mean, so it returns a median of ONE event per trench (mean 1.74, max
-# 8 over 202 trenches) and a trench's second and third excursions are invisible by
-# construction. In 114 of 236 trenches that bar sits ABOVE the trench's own lit Tukey fence
-# -- i.e. across half the dataset v10 is stricter than "an outlier among this trench's own
-# lit values". v9 has the opposite problem: no bar at all, 39% singletons, and it reports
-# onset so it matches 16 of v6's 156 events where v10 matches 91.
-#
-# v11 = v9's candidate structure + a bar estimated on the LIT values only + peak reporting.
-# The bar is the repair of v8's diagnosis rather than a repeat of it: v8 collapsed because
-# median and MAD were taken over a zero-inflated column, and conditioning on lit removes the
-# zero inflation while staying dimensionally matched (a cell-mean bar for a cell-mean
-# measurement, unlike the rejected per-pixel display span).
-#
-# Constants are set by the sweep in the summary notebook; quote each with its measured band.
-BURST_DEF_V11 = {
-    **BURST_DEF_V9,
-    'version': 'v11',
-    'signal': 'per-trench lit fence cluster',
-    'seed_rule': 'mad',         # 'tukey' | 'mad' | 'otsu'
-    'iqr_k': 1.5,               # unused under seed_rule='mad'
-    'k': 4.0,                   # median + k * 1.4826 * MAD, over the LIT values only
-    'min_lit': 5,               # below this many lit cell-frames a quantile is meaningless
-    'sparse_admit': True,       # ... and those trenches admit every lit cell-frame instead
-    'lit_gate': 0.95,
-    'min_frames': 2,            # seed-cluster duration in distinct frames -- a NEW axis
-    'frac_min': 0.0,            # measured INERT; see the sweep note below
-}
-# Why these, and the band for each (bursts.md §7 v11 has the tables):
-#
-#   seed_rule='mad'  The lit TUKEY fence fails the regression outright -- 1 of 3 trenches at
-#       every multiplier from 1.5 to 6.0. On a trench where the burst is a large share of the
-#       lit values it inflates Q3 and the IQR together: 003/1598 is 5% lit, so its fence
-#       (2.080) lands ABOVE the burst itself (2.062), where median+4*MAD sits at 0.935.
-#       'otsu' passes 3/3 and is knob-free, but costs controls at matched recall (at gate
-#       0.95 / min_frames 2 it gives 542 events with mazF 13 / chpS 44 against mad's 469 with
-#       9 / 34). Kept selectable; not shipped.
-#   k=4.0  INHERITED, not fitted -- it is the same multiplier v1-v7 use for the height bar.
-#       There is no plateau here: at gate 0.95 / min_frames 2, k = 3.0/3.5/4.0/4.5/5.0 gives
-#       550/496/469/446/410 events and chpS 49/39/34/29/25, monotone. So k is an honest
-#       recall/control trade knob, and it is set by precedent rather than tuned.
-#   lit_gate=0.95  hupA holds at 0 for EVERY gate up to 0.995 and breaks only when the gate
-#       is removed (1.01 -> 5 events), because hupA's own minimum lit fraction is 0.9959.
-#       That band is far wider than v10's (hupA clean only for k >= 0.60, two points tested)
-#       and wider than v9's 0.60-0.90. 0.95 sits inside it with margin.
-#   min_frames=2  A NEW axis: bursts.md records no swept duration gate anywhere. It is the
-#       minimum statement of persistence -- "seen in at least two frames" -- and it is what
-#       lets the lit gate be relaxed from v9's 0.90 to 0.95. At gate 0.95, min_frames
-#       1/2/3/4 gives 789/469/353/262 events and chpS 51/34/24/18.
-#   frac_min=0.0  Measured INERT. At gate 0.95 / min_frames 2, frac_min 0.2 removes 37 events
-#       (469 -> 432) and changes the controls by nothing at all (mazF 9, chpS 34 either way).
-#       `fiji_frac` had never been thresholded by any definition; now it has been, and it
-#       buys nothing. Kept as a parameter, shipped off.
-#   sparse_admit=True  Also measured inert: identical event counts either way at every swept
-#       setting, because min_frames >= 2 already removes every trench with fewer than 5 lit
-#       cell-frames. Kept because it documents a real choice.
-#   link_dt=2, link_dy_cell_lengths=1.5  INHERITED from v9, not re-tuned. Sensitivity at the
-#       shipped setting: (1,1.0) 601 events / (2,1.5) 469 / (3,2.5) 402, with v6 exact frames
-#       85/89/89 -- so the choice moves the count by 1.5x and the frame agreement barely.
-
-BURST_DEF = BURST_DEF_V3          # shipped default; bursts_082026.csv was made with this
-BURST_DEFS = {'v1': BURST_DEF_V1, 'v2': BURST_DEF_V2, 'v3': BURST_DEF_V3,
-              'v4': BURST_DEF_V4, 'v5': BURST_DEF_V5, 'v6': BURST_DEF_V6,
-              'v7': BURST_DEF_V7, 'v8': BURST_DEF_V8, 'v9': BURST_DEF_V9,
-              'v10': BURST_DEF_V10, 'v11': BURST_DEF_V11}
-
-# Route precedence, strongest first. Used to pick an episode's representative peak and the
-# survivor of a concurrent merge. A confirmed bright peak must always outrank a ratio-only
-# one, or a fold candidate on a rising shoulder absorbs the real peak behind it.
-ROUTE_RANK = {'absolute': 0, 'fold': 1, 'fold_left': 2, 'tukey': 3, 'fiji': 4,
-              'lit': 5, 'lit_fence': 6}
-# 'tukey' ranks LAST deliberately: it is the weakest evidence, so it is always the
-# candidate dropped when it collides with a v6-route event in a concurrent merge, and
-# never the one that represents a mixed episode. That is what lets v7 add without
-# relabelling anything v6 already found.
+REVIEWED_GENES = ('alkA', 'araB', 'baeS', 'chpS', 'gfcE', 'gldA', 'lacZ')
+UNREVIEWED_GENES = ('hupA', 'mazF')
 
 
-def prom_multiplier(bdef):
-    """The prominence multiplier a definition asks for, falling back to `k` when unset.
-
-    Keeps v1-v3 bit-identical under the v4 signature: they leave `k_prom` None, so the single
-    `k` still drives both bars.
-    """
-    kp = bdef.get('k_prom')
-    return bdef['k'] if kp is None else kp
-
-
-# ---------------------------------------------------------------------------------------
-# The input filter -- applied before ANY definition runs
-# ---------------------------------------------------------------------------------------
-
-# Not part of a version's rule: the same status as the failed-run exclusion.
-#
-# RELATIVE, not an absolute px^2 threshold. DUMM_giTG66_Glucose_012325 was recorded at ~1/3
-# the linear pixel scale of every other run (cells, widths AND trenches all ~0.34x; median
-# cell area 33 px^2 against 263 px^2 elsewhere), and its masks are geometrically sound --
-# area/(L*W) = 0.783 vs 0.767, both matching pi/4 for an ellipse. An absolute 50 px^2 floor
-# deleted 749 of its 844 good cell-frames; the relative floor drops 121 across the dataset, of
-# which 1. Nothing in the pipeline records pixel size, so the threshold has to be scale-free,
-# exactly as delta_y_cell_lengths is.
-MIN_CELL_AREA_FRAC = 0.05          # 5% of the experiment's own median cell area
+# loads data and drops kymographs that failed/wanted to exclude 
+def drop_excluded_kymographs(df, name='table', excluded=FAILED_KYMOGRAPHS, verbose=True,
+                             require_match=True):
+    
+    if not excluded or not len(df):
+        return df
+    key = list(zip(df['experiment_name'], df['FOV'], df['trench_id']))
+    hit = pd.Series([k in set(excluded) for k in key], index=df.index)
+    present = {k for k in key}
+    if require_match:
+        unmatched = [t for t in excluded if tuple(t) not in present]
+        assert not unmatched, (
+            f'{name}: these FAILED_KYMOGRAPHS entries match no trench ')
+    if verbose and hit.any():
+        print(f'  {name}: dropped {int(hit.sum())} rows in {len(excluded)} excluded '
+              f'kymograph(s) (FAILED_KYMOGRAPHS)')
+    return df[~hit].copy()
 
 
-def drop_degenerate_masks(df, frac=MIN_CELL_AREA_FRAC, exp_median_area=None, verbose=True):
-    """Drop cell-frames whose mask is below `frac` of their experiment's median cell area.
+def _read_annotated(csv_path, name, drop_failed, data_root='', drop_excluded=True):
 
-    Sorted burst-cell areas were `[1, 1, 1, 2, 2, 117, 131, ...]`: only 0.11% of cell-frames
-    are <=5 px^2, yet 5 of 95 v2 bursts landed on them -- a 48x enrichment. On a 1-pixel mask
-    the mean intensity is a single raw pixel with no averaging, which is exactly how a false
-    peak clears a threshold built from properly-averaged cells.
+    df = pd.read_csv(os.path.join(data_root, csv_path), dtype=READ_DTYPES)
+    assert df['FOV'].str.len().eq(3).all(), f'{name}: FOV lost its zero padding'
+    assert 'is_failed_experiment' in df.columns, (
+        f'{name}: no is_failed_experiment column -- this is not an annotated export')
+    if drop_failed:
+        df = df[~df['is_failed_experiment']].copy()
+    if drop_excluded:
+        df = drop_excluded_kymographs(df, name)
+    return keep_tracked_genes(df, name)
 
-    Args:
-        exp_median_area: Series indexed by experiment_name. Pass the medians computed on the
-            FULL table, so the floor does not move when `df` is scoped to a subset. Computed
-            from `df` when omitted.
+# the genes of interest are exactly the keys of STRAIN_EXP_DICT; rows of any other gene
+# (or of a FOV with no gene) are dropped at load, so the frozen CSVs need not be rewritten
+GENES = tuple(STRAIN_EXP_DICT)
 
-    The annotated exports already carry the equivalent verdict as `is_degenerate_mask`; using
-    that column is preferred, because it was computed against the full 23-experiment medians.
-    """
-    if exp_median_area is None:
-        exp_median_area = df.groupby('experiment_name')['area'].median()
-    floor = frac * df['experiment_name'].map(exp_median_area)
-    assert floor.notna().all(), 'an experiment is missing from exp_median_area'
-    keep = df['area'] >= floor
-    if verbose:
-        print(f"area floor {frac:.0%} of each experiment's own median: "
-              f'{len(df):,} -> {int(keep.sum()):,} cell-frames '
-              f'({int((~keep).sum()):,} dropped, {100 * (~keep).mean():.2f}%)')
+
+def keep_tracked_genes(df, name='table', verbose=True):
+    keep = df['gene'].isin(GENES)
+    if verbose and (~keep).any():
+        print(f'  {name}: dropped {int((~keep).sum())} rows outside STRAIN_EXP_DICT')
     return df[keep].copy()
 
 
-# ---------------------------------------------------------------------------------------
-# v1 core -- the detector every version calls
-# ---------------------------------------------------------------------------------------
+def load_divisions(path='data/divisions_082026.csv', data_root='', verbose=True):
+    d = pd.read_csv(os.path.join(data_root, path), dtype=READ_DTYPES)
+    d['FOV'] = d['FOV'].str.zfill(3)
+    return keep_tracked_genes(d, 'divisions', verbose)
 
-def _link_ty_components(frames, ys, tol, link_dt):
-    """Connected components of cell-frames in (time, y). Returns one label per row.
 
-    Two cell-frames join when they are within `link_dt` frames AND within `tol` pixels in y,
-    that y tolerance SCALED by the frame gap because cells advect down the trench (-4.7
-    px/frame median, -17 at p10) -- a fixed tolerance fragments any drifting burst.
+def load_cells(cells_csv=CELLS_CSV, drop_failed=True, data_root='', drop_excluded=True):
+    return _read_annotated(cells_csv, 'cells', drop_failed, data_root, drop_excluded)
 
-    `gap != 0` is deliberate: two cells in the SAME frame never link directly, only through a
-    shared neighbour in an adjacent frame. Two bursts running side by side in one trench are
-    different events.
+def clean_cells(data_root=''):
+    c = load_cells(data_root=data_root)
+    return c[~c['is_degenerate_mask']].reset_index(drop=True)
 
-    `frames` must be sorted ascending; the inner loop stops at the first row beyond `link_dt`.
-    Shared by v9's any-signal clustering and v11's seed clustering so the two cannot drift.
+def load_fiji(path=INPUTS['fiji'], data_root=''):
+    f = pd.read_csv(os.path.join(data_root, path), dtype=READ_DTYPES)
+    f['FOV'] = f['FOV'].str.zfill(3)
+    return f
+
+#read a burst table written by build_all 
+def load_bursts(bursts_csv=BURSTS_CSV, version=None, data_root='', expect_n=None):
+    b = pd.read_csv(os.path.join(data_root, bursts_csv), dtype=READ_DTYPES)
+    b['FOV'] = b['FOV'].str.zfill(3)
+    b = keep_tracked_genes(b, bursts_csv)
+    if version is not None:
+        col = f'burst_{version}'
+        if col not in b.columns:
+            have = sorted(c for c in b.columns if c.startswith('burst_'))
+            raise ValueError(f'{bursts_csv} has no {col!r} column; it carries {have}')
+        b = b[b[col].astype(bool)].reset_index(drop=True)
+    if expect_n is not None and len(b) != expect_n:
+        raise AssertionError(f'expected {expect_n} {version!r} rows in {bursts_csv}, '
+                             f'got {len(b)}')
+    return b
+
+def trench_index(cells):
+    g = cells.groupby(KYMO_KEY, sort=True)
+    out = pd.DataFrame({
+        'gene': g['gene'].first(),
+        'n_cell_frames': g.size(),
+        'n_tracks': g['track_id'].nunique(),
+        'n_time_frames': g['time_frame'].nunique(),
+        'first_frame': g['time_frame'].min(),
+        'last_frame': g['time_frame'].max(),
+    }).reset_index()
+    out['reviewed'] = out['gene'].isin(REVIEWED_GENES)
+    return out
+
+# for V1 calculates baseline and MAD scale thats then used for v1 burst detection. 
+# baseline = median fluorescence 
+# scale = 1.4826 * MAD (median absolute deviation) 
+# all grouped by (gene, experiment), returns dataframe with median and mad_scale 
+def compute_baselines(df, fluor_col=FLUOR_COL):
+    rows = []
+    for (gene, exp), g in df.groupby(['gene', 'experiment_name']):
+        x = g[fluor_col].to_numpy()
+        med = np.median(x)
+        mad = np.median(np.abs(x - med))
+        rows.append({'gene': gene, 'experiment_name': exp,
+                     'median': med, 'mad_scale': 1.4826 * mad})
+    base = pd.DataFrame(rows).set_index(['gene', 'experiment_name'])
+    base['mad_scale'] = base['mad_scale'].clip(lower=1e-6)
+    return base
+
+
+# brightest cell at each frame tracked across time. since a expression dilutes over time we should be able to see a peak
+# and follow that decay. This identifies lineages by following the brightest cell at each frame 
+def trench_max_envelope(df_trench, fluor_col=FLUOR_COL):
+    idx = df_trench.groupby('time_frame')[fluor_col].idxmax()
+    return df_trench.loc[idx].sort_values('time_frame').reset_index(drop=True)
+
+# this time grouping by lineage and not just brightest cell assumption 
+def lineage_family_roots(df_trench):
+    par = df_trench.groupby('track_id')['parent_track_id'].first().to_dict()
+    out = {}
+    for t in par:
+        cur, seen = int(t), set()
+        while True:
+            p = par.get(cur)
+            if pd.isna(p) or int(p) not in par or int(p) in seen:
+                break
+            seen.add(cur)
+            cur = int(p)
+        out[int(t)] = cur
+    return out
+
+# input is parent cell, produces all the parent and daughter cells within that kymograph for given cell 
+def _relatives(par):
+    kids = {}
+    for t, p in par.items():
+        if p is not None and p in par:
+            kids.setdefault(p, []).append(t)
+
+    def walk(t, step, seen):
+        out = set()
+        stack = [t]
+        while stack:
+            cur = stack.pop()
+            for nxt in step(cur):
+                if nxt not in out and nxt != t:
+                    out.add(nxt)
+                    stack.append(nxt)
+        return out
+
+    up = lambda t: [par[t]] if par.get(t) in par else []
+    down = lambda t: kids.get(t, [])
+    return {t: walk(t, up, None) | walk(t, down, None) for t in par}
+
+def _lineage_maps(g):
+    idx = {(int(t), int(f)): i for i, (t, f) in
+           enumerate(zip(g['track_id'].to_numpy(), g['time_frame'].to_numpy()))}
+    par = (g.groupby('track_id')['parent_track_id'].first()
+           .apply(lambda p: int(p) if pd.notna(p) else None).to_dict())
+    kid = {}
+    for t, p in par.items():
+        if p is not None:
+            kid.setdefault(p, []).append(int(t))
+    return idx, par, kid
+
+# a way to track daughter cells to their parent cell after a division 
+def _lineage_lag(g, col, lag):
+    idx, par, _ = _lineage_maps(g)
+    v = g[col].to_numpy(dtype=float)
+    out = np.full(len(g), np.nan)
+    tr = g['track_id'].to_numpy().astype(int)
+    fr = g['time_frame'].to_numpy().astype(int)
+    for i in range(len(g)):
+        t, f = int(tr[i]), int(fr[i])
+        for _ in range(lag):
+            f -= 1
+            if (t, f) in idx:
+                continue
+            p = par.get(t)
+            if p is None or (p, f) not in idx:
+                t = None
+                break
+            t = p
+        if t is not None and (t, f) in idx:
+            out[i] = v[idx[(t, f)]]
+    return out
+
+def _lineage_window(g, col, k, how='max', direction='back'):
+    """Aggregate `col` over the k frames before (or after) each cell-frame, along the lineage.
+
+    Backward is the causal one and the interesting one: `x(t) / median(x(t-k..t-1))` is the
+    per-cell-frame analogue of v1's `fold_left` route. Forward uses the MAX over daughters, matching the max-envelope
+    convention the rest of the codebase uses for inherited signal.
+    """
+    idx, par, kid = _lineage_maps(g)
+    v = g[col].to_numpy(dtype=float)
+    tr = g['track_id'].to_numpy().astype(int)
+    fr = g['time_frame'].to_numpy().astype(int)
+    agg = {'max': np.nanmax, 'median': np.nanmedian, 'mean': np.nanmean,
+           'min': np.nanmin}[how]
+    out = np.full(len(g), np.nan)
+    for i in range(len(g)):
+        vals = []
+        if direction == 'back':
+            t, f = int(tr[i]), int(fr[i])
+            for _ in range(k):
+                f -= 1
+                if (t, f) in idx:
+                    vals.append(v[idx[(t, f)]]); continue
+                p = par.get(t)
+                if p is None or (p, f) not in idx:
+                    break
+                t = p
+                vals.append(v[idx[(t, f)]])
+        else:
+            front = [(int(tr[i]), int(fr[i]))]
+            for _ in range(k):
+                nxt = []
+                for t, f in front:
+                    if (t, f + 1) in idx:
+                        nxt.append((t, f + 1))
+                    else:
+                        nxt += [(c, f + 1) for c in kid.get(t, []) if (c, f + 1) in idx]
+                if not nxt:
+                    break
+                vals += [v[idx[c]] for c in nxt]
+                front = nxt
+        if vals:
+            with np.errstate(all='ignore'):
+                out[i] = agg(vals)
+    return out
+
+# rule used to add time and spatial drift into bursts. Sometimes cell burst will drift over time to a different 
+# y pixel value 
+def _link_ty_capped(frames, ys, slack, drift, link_dt):
+    """Connected components in (t, y) with a tolerance of `slack + drift * dt`.
+
+    The superseded rules linked with a tolerance of `1.5 * cell_length * dt`
+    -- a PRODUCT, so at dt=3 it reaches 4.5 cell lengths, most of a trench. That is fine for
+    a sparse rule but not for a classifier, which lights up whole neighbourhoods: measured on
+    `DUMM_giTG059_060_061125` 008/1488, it linked two cells 109.6 px apart (three cell
+    lengths, opposite ends of the trench) because the tolerance at dt=2 was 110.2 px -- a
+    margin of 0.6 px -- and silently absorbed two hand-labelled bursts into their
+    neighbours' events. The trench went from 5 of 5 labels reported to 3 of 5.
+
+    The product is also the wrong model of the physics. Cells advect about 4.7 px/frame
+    (median; 17 at p10), so the y-displacement to tolerate over dt frames is a DRIFT term
+    plus a fixed spatial slack, not a multiplication. Measured on the shipped model this is
+    better on every axis -- 5/5 labels in that trench and event F1 0.731 against 0.716 --
+    and out of fold the two are tied within noise (0.661 vs 0.667).
     """
     n = len(frames)
     parent = list(range(n))
@@ -534,587 +332,298 @@ def _link_ty_components(frames, ys, tol, link_dt):
 
     for i in range(n):
         j = i + 1
-        # `frames` is sorted, so stop as soon as the gap exceeds link_dt
         while j < n and frames[j] - frames[i] <= link_dt:
             gap = frames[j] - frames[i]
-            if gap != 0 and abs(ys[j] - ys[i]) <= tol * gap:
+            if gap != 0 and abs(ys[j] - ys[i]) <= slack + drift * gap:
                 ri, rj = find(i), find(j)
                 if ri != rj:
                     parent[rj] = ri
             j += 1
-
     return [find(i) for i in range(n)]
 
+# loads cell-frame columns 
+def make_row_key(exp, fov, trench, track_id, time_frame):
+    """One text field identifying a cell-frame: exp|FOV|trench|track|time_frame.
 
-def detect_bursts_lit(df, fluor_col='fiji_mean', lit_gate=0.60, link_dt=2,
-                      link_dy_cell_lengths=1.5, min_cell_frames=1,
-                      constitutive_genes=None):
-    """Any-signal burst detection on the FIJI-transformed values, deduplicated in (time, y).
-
-    A candidate is any cell-frame with `fluor_col` > 0 -- i.e. some of the cell survived the
-    0.25*max clip AND the small-object removal. Candidates in one kymograph are linked into
-    events by connected components: two lit cell-frames join when they are within `link_dt`
-    frames AND within `link_dy_cell_lengths` cell lengths in y, that y tolerance SCALED by
-    the frame gap because cells advect (-4.7 px/frame median, -17 at p10). Each component is
-    one event, reported at its earliest frame -- onset, matching merge_keep='earliest'.
-
-    The cell length is the trench's own median `axis_major_length`, so the tolerance is
-    scale-free; an absolute pixel figure would mis-merge the ~1/3-scale
-    DUMM_giTG66_Glucose_012325 (median cell area 34 px^2 against 263-398 elsewhere).
-
-    `lit_gate` rejects a trench where more than this fraction of its cell-frames are lit.
-    Mandatory, not tuning: the floor is 25% of each trench's own max, so a uniformly bright
-    trench lights up completely and the lit fraction runs inversely to burstiness (hupA
-    99.9%, mazF 85.1%, araB 4.9%). At 0.60 hupA goes to exactly zero. See the BURST_DEF_V9
-    comment for what that costs.
-
-    `min_cell_frames` drops events made of fewer than this many lit cell-frames; 39% of
-    events are singletons, so 1 (the default) keeps them and >1 is a real biological filter.
-
-    Emits `detect_bursts`' columns so add_relative_y and build_burst_csv work unchanged, with
-    route='lit'. `threshold` is 0.0 because the real threshold lives inside the transform,
-    as the trench's own display floor -- carried separately as `fiji_vmin` where available.
+    FOV is zero-filled to 3 here so a key built from a de-padded spreadsheet cell still
+    matches one built from the tables.
     """
-    constitutive_genes = constitutive_genes or set()
-    records = []
+    return '|'.join([str(exp), str(fov).zfill(3), str(trench),
+                         str(int(track_id)), str(int(time_frame))])
 
-    for (exp, fov, trench), df_trench in df.groupby(KYMO_KEY):
-        gene = df_trench['gene'].iloc[0]
-        lit = df_trench[df_trench[fluor_col] > 0]
-        if lit.empty:
-            continue
-        if len(lit) / len(df_trench) > lit_gate:
-            continue                      # uniformly lit: constitutive, not a burst
+def _load_time_dict(time_dict=None, data_root=''):
+    if time_dict is not None:
+        return time_dict
+    with open(os.path.join(data_root, TIME_DICT_JSON)) as fh:
+        return json.load(fh)
 
-        cell_len = float(df_trench['axis_major_length'].median())
-        if not np.isfinite(cell_len) or cell_len <= 0:
-            continue
-        tol = link_dy_cell_lengths * cell_len
+# determines beginning and end time frame and returns None for end frames to go to the end of the frame 
+def trench_window(exp, fov, trench, time_dict=None, data_root=''):
+    td = _load_time_dict(time_dict, data_root)
+    entry = td.get(exp, {}).get(str(fov).zfill(3), {}).get(str(trench))
+    if entry is None:
+        return None
+    end = entry.get('end')
+    return int(entry.get('start', 0) or 0), (None if end in (None, '', 0) else int(end))
 
-        d = lit.sort_values('time_frame').reset_index(drop=True)
-        d['_ev'] = _link_ty_components(d['time_frame'].to_numpy(),
-                                       d['centroid_y'].to_numpy(), tol, link_dt)
-        for _, ev in d.groupby('_ev', sort=False):
-            if len(ev) < min_cell_frames:
-                continue
-            ev = ev.sort_values('time_frame')
-            onset = ev.iloc[0]                              # report burst onset
-            peak = ev.loc[ev[fluor_col].idxmax()]
-            records.append({
-                'experiment_name': exp, 'FOV': fov, 'trench_id': trench,
-                'track_id': int(onset['track_id']),
-                'predicted_lineage': onset['predicted_lineage'],
-                'node_id': int(onset['node_id']),
-                'time_frame': int(onset['time_frame']),
-                'fluor': float(onset[fluor_col]), 'gene': gene,
-                'threshold': 0.0, 'route': 'lit',
-                'n_cell_frames': int(len(ev)),
-                'n_frames': int(ev['time_frame'].max() - ev['time_frame'].min() + 1),
-                'peak_fluor': float(peak[fluor_col]),
-                'peak_time_frame': int(peak['time_frame']),
-                'lit_frac': float(len(lit) / len(df_trench)),
-            })
+# Labels dropped as probable mislabels, with the measurement that condemned each. All three
+# sit below the 0.50 within-trench percentile and carry no signal on any available axis:
+# fold-above-own-past medians 1.15 against a negative population whose p90 is 1.30, frame
+# rank 0.22-0.50 (not even the brightest cell present), and 2 of 3 have fiji_mean exactly 0.
+# The middle one is FALLING relative to its own recent past (fold 0.834), i.e. a decay tail
+# or the wrong cell. Confirmed with the labeller before removal -- do not silently re-add.
+KNOWN_MISLABELS = [
+    ('DUMM_giTG062_064_121325', '015', '1235', 21, 19),
+    ('DUMM_giTG064_Glucose_022625', '001', '1596', 19, 66),
+    ('DUMM_giTG064_Glucose_022625', '015', '1584', 1, 17),
+]
 
-    cols = ['experiment_name', 'FOV', 'trench_id', 'track_id', 'predicted_lineage',
-            'node_id', 'time_frame', 'fluor', 'gene', 'threshold', 'route',
-            'n_cell_frames', 'n_frames', 'peak_fluor', 'peak_time_frame', 'lit_frac',
-            'is_constitutive']
-    if not records:
-        return pd.DataFrame(columns=cols)
-    bursts = pd.DataFrame(records)
-    bursts['is_constitutive'] = bursts['gene'].isin(constitutive_genes)
-    return bursts.reset_index(drop=True)
+# fixes excel fill handle, can probably get rid of this 
+def _repair_experiment_names(d, known, verbose=True):
+    """Fix experiment names mangled by Excel's fill handle.
 
-
-def detect_bursts_seeded(df, fluor_col='fiji_mean', thresh_col='_lit_thresh',
-                         lit_gate=0.90, link_dt=2, link_dy_cell_lengths=1.5,
-                         min_frames=1, frac_min=0.0, frac_col='fiji_frac',
-                         constitutive_genes=None):
-    """v11: seed on a trench's own lit distribution, cluster in (t, y), report the PEAK.
-
-    v9 accepts every lit cell-frame and reports each cluster's onset. v10 accepts a peak that
-    reaches 0.60 of the trench's single brightest cell-mean. Both are answers to the wrong
-    question. v9's bar is so low that 39% of its events are single cell-frames with a peak
-    around 0.1 counts; v10's is anchored to one order statistic, so it finds a median of ONE
-    event per trench and a trench's second and third excursions cannot register -- measured,
-    in 114 of 236 trenches v10's bar sits ABOVE that trench's own lit Tukey fence.
-
-    v11 keeps v9's structure and changes the two things that are actually wrong with it:
-
-      1. SEEDS, not every lit cell-frame. A seed clears `thresh_col`, the bar
-         attach_lit_baseline estimates on that trench's lit values only.
-      2. The event is reported at its PEAK cell-frame, not its onset. v9's `time_frame` and
-         `peak_time_frame` agree on only 51% of its rows, which is most of why it matched
-         16 of v6's 156 events where v10 matched 91.
-
-    Events are connected components of the SEED set under v9's linking rule (`_link_ty_components`,
-    shared so the two cannot drift). Seeding first is what avoids v9's over-merge: its longest
-    event spans 87 frames because a whole lit trench is one component, whereas a lit blob here
-    yields as many events as it holds seed clusters.
-
-    The surrounding lit extent is measured by linking the LIT set as well and reporting, per
-    event, the lit component its seeds fall in (`n_lit_cell_frames`, `lit_first`, `lit_last`).
-    Reported, never gating -- duration is a property to look at, not yet a filter with a
-    measured band.
-
-    `lit_gate` is carried over from v9 and is doing the constitutive control's work: hupA is
-    lit in 99.7% of its cell-frames, so the gate discards all seven of its trenches wholesale
-    rather than discriminating events inside them. That is blunt, and it is the honest
-    limitation of this route -- the fence itself flags hupA 2.20%, mazF 2.78% and chpS 2.63%
-    of cell-frames against araB's 0.36%, i.e. the controls sit mid-pack, much as bursts.md
-    §8 records for the raw-F Tukey fence.
-
-    `min_frames` gates on how many distinct frames a seed cluster spans. bursts.md records no
-    swept duration gate anywhere, so this is a genuinely new axis rather than a re-tread.
-    `frac_min` gates on `fiji_frac` at the peak -- the fraction of the cell's own pixels above
-    the floor, which separates a coherent bright cell from a speckle and which no definition
-    has ever thresholded.
+    Dragging a cell down in Excel increments a trailing number, so
+    `DUMM_giTG059_060_061125` became `...061126`, `...061127`, `...061128`, `...061129` on
+    consecutive rows. Rather than hard-coding that, this finds unknown names whose digits-only
+    suffix differs from exactly one KNOWN experiment sharing the same non-digit prefix, and
+    which also has the row's (FOV, trench) -- so a repair has to be corroborated by the data,
+    not just by string similarity.
     """
-    constitutive_genes = constitutive_genes or set()
-    records = []
+    out = d.copy()
+    fixes = {}
+    for name in sorted(set(out['experiment_name']) - set(known)):
+        stem = re.sub(r'\d+$', '', name)
+        cand = [k for k in known if re.sub(r'\d+$', '', k) == stem]
+        if len(cand) == 1:
+            fixes[name] = cand[0]
+    if fixes:
+        out['experiment_name'] = out['experiment_name'].replace(fixes)
+        if verbose:
+            print(f'  repaired {len(fixes)} Excel fill-handle experiment name(s):')
+            for k, v in fixes.items():
+                print(f'    {k}  ->  {v}   ({int((d.experiment_name == k).sum())} row(s))')
+    return out, fixes
 
-    for (exp, fov, trench), df_trench in df.groupby(KYMO_KEY):
-        gene = df_trench['gene'].iloc[0]
-        lit = df_trench[df_trench[fluor_col] > 0]
-        if lit.empty:
+# loads manually labeled bursts from csv 
+def load_hand_labels(path=INPUTS['labels'], cells=None, data_root='', genes=None,
+                     verbose=True, extra_cols=()):
+    if isinstance(path, pd.DataFrame):
+        full, d = 'labels DataFrame', path.astype(str).copy()
+    else:
+        full = os.path.join(data_root, path)
+        d = pd.read_csv(full, dtype=str, keep_default_na=False)
+    n_in = len(d)
+    known = set(cells['experiment_name'].unique())
+    d, _ = _repair_experiment_names(d, known, verbose=verbose)
+
+    d['FOV'] = d['FOV'].str.strip().str.zfill(3)
+    d['trench_id'] = d['trench_id'].str.strip()
+    d['track_id'] = d['track_id'].astype(float).astype(int)
+    d['viewer_frame'] = d['frame'].astype(float).astype(int)
+    d['gene'] = d['gene'].str.strip()
+
+    _n_before = len(d)
+    d = drop_excluded_kymographs(d, 'hand labels', verbose=False, require_match=False)
+    if verbose and len(d) < _n_before:
+        print(f'  dropped {_n_before - len(d)} label(s) in an excluded kymograph '
+              f'(experiment_metadata.FAILED_KYMOGRAPHS) -- not a labelling error')
+
+    if genes is not None:
+        keep_gene = d['gene'].isin(tuple(genes))
+        if verbose and not keep_gene.all():
+            dropped = d.loc[~keep_gene, 'gene'].value_counts().to_dict()
+            print(f'  label CSV holds {n_in} rows; keeping genes {tuple(genes)}, '
+                  f'setting aside {dropped}')
+        d = d[keep_gene].reset_index(drop=True)
+        n_in = len(d)
+
+    starts, why = [], []
+    for r in d.itertuples():
+        w = trench_window(r.experiment_name, r.FOV, r.trench_id, data_root=data_root)
+        starts.append(np.nan if w is None else w[0])
+        why.append('' if w is not None else 'trench not in the time dict')
+    d['start_frame'] = starts
+    d['why'] = why
+    d['time_frame'] = (d['viewer_frame'] - d['start_frame']).astype('Int64')
+
+    c = cells[FRAME_KEY + ['gene']].copy()
+    c['track_id'] = c['track_id'].astype(int)
+    c['time_frame'] = c['time_frame'].astype(int)
+    m = d.merge(c.rename(columns={'gene': '_gene_cells'}),
+                left_on=KYMO_KEY + ['track_id', 'time_frame'],
+                right_on=FRAME_KEY, how='left')
+
+    ok = m[m['_gene_cells'].notna()].copy()
+    bad = m[m['_gene_cells'].isna()].copy()
+
+    # Diagnose each reject against what actually exists there, so the re-check is targeted.
+    diag = []
+    for r in bad.itertuples():
+        if r.why:
+            diag.append(r.why)
             continue
-        lit_frac = len(lit) / len(df_trench)
-        if lit_frac > lit_gate:
-            continue                      # uniformly lit: constitutive, not a burst
-
-        assert df_trench[thresh_col].nunique(dropna=False) <= 1, (
-            f'{thresh_col} varies within {exp} {fov}/{trench}; it must be per-trench')
-        thresh = df_trench[thresh_col].iloc[0]
-        if not np.isfinite(thresh):
-            continue                      # too few lit cell-frames to place a bar
-
-        cell_len = float(df_trench['axis_major_length'].median())
-        if not np.isfinite(cell_len) or cell_len <= 0:
+        sub = cells[(cells.experiment_name == r.experiment_name) & (cells.FOV == r.FOV)
+                    & (cells.trench_id == r.trench_id)]
+        if sub.empty:
+            diag.append('no such trench in the cell table')
             continue
-        tol = link_dy_cell_lengths * cell_len
-
-        # The lit extent, for reporting. Same linking rule, run on the lit set.
-        litd = lit.sort_values('time_frame').reset_index(drop=True)
-        litd['_lc'] = _link_ty_components(litd['time_frame'].to_numpy(),
-                                          litd['centroid_y'].to_numpy(), tol, link_dt)
-        lit_ext = {c: (len(gg), int(gg['time_frame'].min()), int(gg['time_frame'].max()))
-                   for c, gg in litd.groupby('_lc', sort=False)}
-
-        seeds = litd[litd[fluor_col] > thresh]
-        if frac_min > 0 and frac_col in seeds.columns:
-            seeds = seeds[seeds[frac_col] >= frac_min]
-        if seeds.empty:
-            continue
-
-        d = seeds.sort_values('time_frame').reset_index(drop=True)
-        d['_ev'] = _link_ty_components(d['time_frame'].to_numpy(),
-                                       d['centroid_y'].to_numpy(), tol, link_dt)
-
-        # The trench's own lit values, for the peak's within-trench percentile.
-        litvals = np.sort(lit[fluor_col].to_numpy(dtype=float))
-
-        for _, ev in d.groupby('_ev', sort=False):
-            n_frames = int(ev['time_frame'].nunique())
-            if n_frames < min_frames:
-                continue
-            peak = ev.loc[ev[fluor_col].idxmax()]
-            n_lit, l0, l1 = lit_ext.get(peak['_lc'], (len(ev), int(ev['time_frame'].min()),
-                                                      int(ev['time_frame'].max())))
-            records.append({
-                'experiment_name': exp, 'FOV': fov, 'trench_id': trench,
-                'track_id': int(peak['track_id']),
-                'predicted_lineage': peak['predicted_lineage'],
-                'node_id': int(peak['node_id']),
-                'time_frame': int(peak['time_frame']),           # the PEAK, not the onset
-                'fluor': float(peak[fluor_col]), 'gene': gene,
-                'threshold': float(thresh), 'route': 'lit_fence',
-                'n_cell_frames': int(len(ev)),
-                'n_frames': n_frames,
-                'peak_fluor': float(peak[fluor_col]),
-                'peak_time_frame': int(peak['time_frame']),
-                'lit_frac': float(lit_frac),
-                'seed_first': int(ev['time_frame'].min()),
-                'seed_last': int(ev['time_frame'].max()),
-                'n_lit_cell_frames': int(n_lit),
-                'lit_first': int(l0), 'lit_last': int(l1),
-                'peak_frac': float(peak[frac_col]) if frac_col in ev.columns else np.nan,
-                'peak_pct': float(np.searchsorted(litvals, peak[fluor_col], 'right')
-                                  / len(litvals)),
-            })
-
-    cols = ['experiment_name', 'FOV', 'trench_id', 'track_id', 'predicted_lineage',
-            'node_id', 'time_frame', 'fluor', 'gene', 'threshold', 'route',
-            'n_cell_frames', 'n_frames', 'peak_fluor', 'peak_time_frame', 'lit_frac',
-            'seed_first', 'seed_last', 'n_lit_cell_frames', 'lit_first', 'lit_last',
-            'peak_frac', 'peak_pct', 'is_constitutive']
-    if not records:
-        return pd.DataFrame(columns=cols)
-    bursts = pd.DataFrame(records)
-    bursts['is_constitutive'] = bursts['gene'].isin(constitutive_genes)
-    return bursts.reset_index(drop=True)
-
-
-def attach_fiji_scale(df, fluor_col='fiji_mean', med_col='_base_med',
-                      scale_col='_base_scale'):
-    """Baseline columns that express v5's thresholds as fractions of the TRENCH'S OWN peak.
-
-    Attaches `med = 0` and `scale = max(fluor_col)` per kymograph, for
-    `detect_bursts(baseline_cols=...)`. `k` and `k_prom` then read as "peak must reach k x
-    the brightest cell-mean in this trench" and "and rise by k_prom x it".
-
-    Why not the (gene, experiment) median + MAD that v1-v7 use: on the FIJI-transformed
-    column it COLLAPSES. Measured, 11 of 28 (gene, experiment) groups give median 0 with
-    mad_scale floored at 1e-6 -- so height ~ 0 and every local maximum qualifies. Trenches
-    in a collapsed group fire on 74.1% of their local maxima against 42.9% for healthy ones,
-    and the collapsed groups are exactly the dim interesting genes (all of araB, all of lacZ,
-    all of gfcE). A per-kymograph median+MAD does not rescue it either: ~35k rows still have
-    zero scale and the controls get worse.
-
-    Why the trench's own MAX and not the display span or a p90: dimensions. `fiji_mean` is
-    averaged over a cell (~2-6 counts) while `fiji_vmax - fiji_vmin` is a per-PIXEL range
-    (~25), so a span-scaled bar is the same size as the peak -- the mismatch that sank v8,
-    and it yields 0 workable settings. The p90 cell-mean gives only 1 of 3 regression
-    trenches. The max is the only scale tried that is both non-collapsing and dimensionally
-    matched.
-
-    Trenches whose max is 0 get NaN and are skipped by detect_bursts' isfinite guard.
-    """
-    out = df.copy()
-    peak = out.groupby(KYMO_KEY, dropna=False, sort=False)[fluor_col].transform('max')
-    out[med_col] = 0.0
-    out[scale_col] = peak.where(peak > 0)
-    return out
-
-
-def attach_lit_baseline(df, fluor_col='fiji_mean', rule='tukey', iqr_k=1.5, k=4.0,
-                        min_lit=5, sparse_admit=True, thresh_col='_lit_thresh',
-                        frac_col='_lit_frac', n_col='_lit_n', tag_col='_lit_rule'):
-    """A per-trench bar estimated on that trench's LIT cell-frames only -- v11's baseline.
-
-    This is the repair of v8's diagnosed cause of death, not a re-run of it. v8 collapsed
-    because it estimated location and scale over a ZERO-INFLATED column: 62.6% of cell-frames
-    are exactly 0, so the median is 0 and the MAD floors at 1e-6, giving a bar of ~4e-6 that
-    every blip clears. Conditioning on `fluor_col > 0` removes the zero inflation, and unlike
-    the rejected `fiji_vmax - fiji_vmin` scale the result is dimensionally matched -- a
-    cell-mean bar for a cell-mean measurement.
-
-    It is also not v7's fence. attach_kymograph_fence computes Q3 and the IQR over ALL of a
-    trench's cell-frames, which on this column are both 0; and it runs on raw `fluor_per_ms`,
-    a different measurement entirely.
-
-    Three rules, all swept:
-      'tukey'  Q3 + iqr_k * IQR of the lit values      (shape-aware, iqr_k is the knob)
-      'mad'    median + k * 1.4826 * MAD of the lit values
-      'otsu'   1-D Otsu on log1p of the lit values     (KNOB-FREE)
-
-    Otsu runs on log1p because a trench's lit values span orders of magnitude and Otsu
-    maximises between-class variance, which on a linear scale is dominated by the single
-    brightest cell -- the same failure that limits v10 to one event per trench.
-
-    `min_lit` / `sparse_admit`: a quantile is meaningless on a handful of points, but a
-    trench with three lit cell-frames in an otherwise dark movie is the clearest burst
-    evidence in the dataset. So below `min_lit` the bar is set to 0 (admit every lit
-    cell-frame) rather than NaN. Set `sparse_admit=False` to skip those trenches instead;
-    both arms are swept. A trench with NO lit cell-frames always gets NaN and is skipped by
-    the detector's isfinite guard.
-
-    Attached as COLUMNS, for the same reason attach_kymograph_fence is: a statistic computed
-    inside a detector would be per-subgroup, not per-trench.
-    """
-    out = df.copy()
-    thresh = pd.Series(np.nan, index=out.index, dtype=float)
-    lit_frac = pd.Series(np.nan, index=out.index, dtype=float)
-    lit_n = pd.Series(0, index=out.index, dtype=int)
-
-    for _, g in out.groupby(KYMO_KEY, dropna=False, sort=False):
-        x = g[fluor_col].to_numpy(dtype=float)
-        v = x[np.isfinite(x) & (x > 0)]
-        lit_frac.loc[g.index] = len(v) / len(g) if len(g) else np.nan
-        lit_n.loc[g.index] = len(v)
-        if len(v) == 0:
-            continue                                  # nothing lit -> no bar, trench skipped
-        if len(v) < min_lit:
-            if sparse_admit:
-                thresh.loc[g.index] = 0.0             # so few lit frames that each is the news
-            continue
-        if rule == 'tukey':
-            q1, q3 = np.percentile(v, [25, 75])
-            t = q3 + iqr_k * (q3 - q1)
-        elif rule == 'mad':
-            m = np.median(v)
-            t = m + k * 1.4826 * np.median(np.abs(v - m))
-        elif rule == 'otsu':
-            from skimage.filters import threshold_otsu
-            lv = np.log1p(v)
-            t = 0.0 if lv.min() == lv.max() else float(np.expm1(threshold_otsu(lv)))
+        at_frame = sorted(sub[sub.time_frame.astype(int) == r.time_frame].track_id.astype(int))
+        of_track = sorted(sub[sub.track_id.astype(int) == r.track_id].time_frame.astype(int))
+        if r.time_frame is pd.NA or r.time_frame < 0:
+            diag.append(f'viewer frame {r.viewer_frame} is before the trench starts '
+                        f'(start={int(r.start_frame)})')
+        elif not of_track:
+            diag.append(f'track {r.track_id} does not exist in this trench')
+        elif not at_frame:
+            diag.append(f'frame {r.time_frame} has no cells (trench ends earlier)')
         else:
-            raise ValueError(f'unknown rule {rule!r}; use tukey, mad or otsu')
-        thresh.loc[g.index] = t
+            diag.append(f'track {r.track_id} exists only at frames {of_track[0]}-{of_track[-1]}, '
+                        f'not {r.time_frame}; tracks present at that frame: {at_frame[:10]}')
+    bad['diagnosis'] = diag
 
-    out[thresh_col] = thresh
-    out[frac_col] = lit_frac
-    out[n_col] = lit_n
-    # A tag, so run_burst_detection_any can refuse a frame built for a different rule. The
-    # bar lives in a column, so nothing else would notice that the definition said 'tukey'
-    # and the attached numbers were 'mad' -- it would just silently report the wrong set.
-    out[tag_col] = _lit_tag(rule, iqr_k, k, min_lit, sparse_admit)
-    return out
+    # Drop the confirmed mislabels before anything downstream can train on them.
+    _bad = set(KNOWN_MISLABELS)
+    _is_bad = [(r.experiment_name, r.FOV, r.trench_id, int(r.track_id), int(r.time_frame))
+               in _bad for r in ok.itertuples()]
+    if any(_is_bad):
+        if verbose:
+            print(f'  dropped {sum(_is_bad)} confirmed mislabel(s) (see KNOWN_MISLABELS)')
+        ok = ok[~pd.Series(_is_bad, index=ok.index)]
+
+    ok['row_key'] = [make_row_key(r.experiment_name, r.FOV, r.trench_id, r.track_id,
+                                  r.time_frame) for r in ok.itertuples()]
+    # `extra_cols` carries further label-file columns through unchanged.
+    keep = KYMO_KEY + ['track_id', 'time_frame', 'viewer_frame', 'gene', 'row_key'] + list(extra_cols)
+    rej = bad[KYMO_KEY + ['track_id', 'viewer_frame', 'gene', 'diagnosis']].copy()
+    rej.insert(0, 'time_frame_tried', bad['time_frame'].values)
+
+    if verbose:
+        print(f'{full}: {n_in} rows -> {len(ok)} resolved, {len(bad)} rejected')
+        print(f'  genes: {ok.gene.value_counts().to_dict()}')
+        print(f'  trenches with labels: {ok.groupby(KYMO_KEY).ngroups}')
+        if len(bad):
+            print(f'  REJECTED (re-check these in the viewer):')
+            for r in rej.itertuples():
+                print(f'    {r.gene} {r.experiment_name} {r.FOV}/{r.trench_id} '
+                      f'track {r.track_id} viewer {r.viewer_frame}: {r.diagnosis}')
+    return ok[keep].reset_index(drop=True), rej.reset_index(drop=True)
 
 
-def _lit_tag(rule, iqr_k, k, min_lit, sparse_admit):
-    knob = iqr_k if rule == 'tukey' else k if rule == 'mad' else None
-    return f'{rule}|{knob}|{min_lit}|{bool(sparse_admit)}'
+def build_manual(clean, labels):
+    """The manual layer: the resolved labels plus geometry and the along-trench position."""
+    _geo = [c for c in GEO_COLS if c in clean.columns]
+    lab = labels.astype({'track_id': int, 'time_frame': int}).merge(
+        clean.astype({'track_id': int, 'time_frame': int})[FRAME_KEY + _geo],
+        on=FRAME_KEY, how='left', suffixes=('', '_cell'))
+    assert lab['centroid_y'].notna().all(), 'a resolved label has no geometry'
+    return add_relative_y(lab, clean).assign(burst_manual=True)
 
 
-def attach_lit_baseline_for(df, bdef):
-    """attach_lit_baseline with the constants a definition asks for. Use this, not the raw
-    call, so the dict is the single source of truth for the bar."""
-    return attach_lit_baseline(df, fluor_col=bdef['fluor_col'],
-                               rule=bdef['seed_rule'], iqr_k=bdef.get('iqr_k', 1.5),
-                               k=bdef.get('k', 4.0), min_lit=bdef.get('min_lit', 5),
-                               sparse_admit=bdef.get('sparse_admit', True))
+
+# V1 bursts: 
+# A frame of a per-lineage-family x spatial-cluster max envelope is a burst when it is a local
+# maximum (+/- `window` frames) admitted by ANY of four routes, tried in this order:
+#
+#   absolute   clears m + k*s AND has topographic prominence >= k_prom*s, where m and s are
+#              the (gene, experiment) median and 1.4826*MAD of `fluor_col`
+#   fold       peak / max(left_base, right_base) >= fold_prom
+#   fold_left  peak / max(left_base, fold_base_floor_frac*m) >= fold_left_prom
+#   tukey      peak > its own trench's Q3 + tukey_iqr_k*IQR
+#
+# Both ratio routes also require peak >= m + fold_height_floor_s*s; the tukey route does not
+# (that is the whole point of it). The four are strictly nested, 98 -> 116 -> 153 -> 161, so
+# each only ever ADDS events. Then an episode merge collapses a slow decay to one event and a
+# concurrent merge collapses one burst seen in two adjacent lineage families.
+# `bursts.md` section 3 has every constant's measured band.
+
+FAMILY_SEP = '#'          #
+
+BURST_DEF_V1 = {
+    'version': 'v1',
+    'fluor_col': FLUOR_COL,       # a.u./ms; detection is invariant to the exposure rescale
+    'baseline_keys': ('gene', 'experiment_name'),   # the scope of m and s
+    'window': 5,                  # +/- frames for the local-max check and peak separation
+    'k': 4.0,                     # absolute route: height bar m + k*s
+    'k_prom': 3.7,                # absolute route: prominence >= k_prom*s; plateau [3.6, 3.8]
+    'fold_prom': 3.3,             # fold route; band (3.10, 3.60]
+    'fold_height_floor_s': 1.0,   # both ratio routes: peak >= m + this*s
+    'fold_left_prom': 3.6,        # fold_left route; band [3.4, 3.79]
+    'fold_base_floor_frac': 0.5,  # fold_left denominator floored at this*m -- NOT optional
+    'tukey_iqr_k': 4.0,           # tukey route multiplier; control-clean only at [4.4, 4.8]
+    'merge_window': 5,            # concurrent merge: peaks this many frames apart ...
+    'merge_gap_cell_lengths': 1.5,    # ... and this close in y are one burst
+    'merge_keep': 'earliest',     # report the ONSET of a merged burst
+    'split_gap_cell_lengths': 1.5,    # cut a lineage family where its cells are this far apart
+    'constitutive_genes': ('mazF', 'hupA', 'chpS'),   # only tags `is_constitutive`
+}
+
+# Route precedence, strongest first. Picks an episode's representative peak and the survivor
+# of a concurrent merge, so a ratio candidate on a rising shoulder can never absorb the
+# confirmed bright peak behind it. 'tukey' ranks LAST, which is what lets that route ADD
+# events without relabelling any the other three found.
+ROUTE_RANK = {'absolute': 0, 'fold': 1, 'fold_left': 2, 'tukey': 3}
 
 
-def attach_fiji_gate(df, fluor_col='fiji_mean', vmin_col='fiji_vmin',
-                     vmax_col='fiji_vmax', col='_fiji_activity'):
-    """Per-kymograph 'how much of this trench is already lit', for the v8 constitutive gate.
-
-    `activity = median(fluor_col) / (vmax - vmin)` over the trench's cell-frames, i.e. where
-    the TYPICAL cell sits above its own display floor as a fraction of the display span.
-    Unit-free, so one bar serves the dataset's ~283x spread of gene brightness.
-
-    Attached as a COLUMN rather than computed inside the detector, for the same reason
-    attach_kymograph_fence is: by the time detection runs, `trench_id` has been rewritten to
-    trench#partition, so a statistic computed there would be per-FAMILY, not per-trench.
-
-    This is what keeps the constitutive control at zero BY MECHANISM. hupA is uniformly
-    bright, so every cell clears its trench's 0.25*max floor (measured: 0.0% zeros, median
-    356 of a 1312 span -> activity 0.27) and a naive "nonzero = candidate" rule would fire on
-    all of it. A bursting trench has a dark median instead (008/1488: median 0 -> activity 0).
-    Note the discriminator is the MEDIAN, not the nonzero FRACTION: 008/1488 is 52.9% nonzero,
-    so a 0.5 fraction gate would reject one of the three regression trenches.
+# main burst detection using V1 rules. For each experiment, FOV, trench pairing the brightest cell at each frame forms 
+# one signal over time, then those candidate peaks are quantified as bursts based on the intensity of their signal and prominence 
+# Then candidates are merged in a rolling window so signal decay is captured as one event instead of many. 
+# returns DataFrame with one row per burst event: experiment_name, FOV, trench_id, track_id,
+# predicted_lineage, node_id, time_frame, fluor, gene, threshold, route, is_constitutive.
+# (track_id / node_id / predicted_lineage identify the brightest cell at the peak.
+def detect_bursts(df, k=4.0, window=5, fluor_col=FLUOR_COL, constitutive_genes=None,
+                  k_prom=None, fold_prom=None, fold_height_floor_s=1.0,
+                  fold_left_prom=None, fold_base_floor_frac=0.5, fence_col=None):
     """
-    out = df.copy()
-    span = (out[vmax_col] - out[vmin_col]).replace(0, np.nan)
-    g = out.groupby(KYMO_KEY, dropna=False, sort=False)
-    med = g[fluor_col].transform('median')
-    out[col] = med / span
-    # The display span, for the fold denominator floor. Same per-trench-column reasoning as
-    # the gate: by detection time `trench_id` is trench#partition.
-    out['_fiji_span'] = span
-    return out
-
-
-def detect_bursts_fiji(df, fluor_col='fiji_mean', window=5, fiji_fold=3.0, fiji_floor=0.0,
-                       fiji_max_activity=0.05, fiji_base_floor_frac=0.05,
-                       gate_col='_fiji_activity', span_col='_fiji_span',
-                       constitutive_genes=None):
-    """Burst detection on the FIJI-transformed per-cell values.
-
-    Same envelope and same episode-merge shape as `detect_bursts`, but every threshold is
-    per-trench or unit-free, because the (gene, experiment) median+MAD baseline collapses on
-    a ~99%-zero column (see the BURST_DEF_V8 comment).
-
-    A candidate is a local maximum on the trench max-envelope that
-      (a) clears `fiji_floor` -- i.e. is nonzero, meaning some of the cell survived the
-          0.25*max clip AND the small-object removal, and
-      (b) reaches `fiji_fold` x its own LEFT base, where that base is FLOORED at
-          `fiji_base_floor_frac` x the trench's display span. Left rather than
-          max(left, right) for the v6 reason: the decay here is dilution by growth, not
-          protein loss, so the right base has not returned to the pre-burst floor and
-          max-base penalises long events.
-
-    Flooring the denominator is not optional, and unlike v6 it cannot be a fraction of the
-    gene median, which is 0 here. An eps-only floor makes the ratio test INERT: with a left
-    base of 0 every nonzero peak scores peak/1e-9 and passes, which is why an early version
-    of this returned ~1000 events and barely responded to `fiji_fold` at all. Same trap
-    bursts.md records for v6 (chpS 010/46 scoring 30x on a left_base of 0.006).
-    and its whole trench must pass the `gate_col` activity gate.
-
-    Prominence is a RATIO because the MAD form is unavailable -- with a baseline of 0 there
-    are no MAD units to express a rise in. The episode reset is the same ratio, matching how
-    the fold routes reset in detect_bursts.
-
-    Emits the same columns as `detect_bursts` so merge_concurrent_bursts and build_burst_csv
-    work unchanged. `threshold` carries the trench's floor, not a gene bar -- the
-    `baseline_scope` column records that.
-    """
-    constitutive_genes = constitutive_genes or set()
-    records = []
-    eps = 1e-9
-
-    for (exp, fov, trench), df_trench in df.groupby(['experiment_name', 'FOV', 'trench_id']):
-        gene = df_trench['gene'].iloc[0]
-        if gate_col in df_trench.columns:
-            assert df_trench[gate_col].nunique(dropna=False) == 1, (
-                f'{gate_col} varies within {exp} {fov}/{trench}; the gate is per-trench')
-            activity = df_trench[gate_col].iloc[0]
-            if np.isfinite(activity) and activity > fiji_max_activity:
-                continue                      # constitutive / uniformly lit: not a burst
-        span = np.nan
-        if span_col in df_trench.columns:
-            span = df_trench[span_col].iloc[0]
-        den_floor = fiji_base_floor_frac * span if np.isfinite(span) else 0.0
-
-        env = trench_max_envelope(df_trench, fluor_col=fluor_col)
-        sig = env[fluor_col].to_numpy()
-        if len(sig) < 3:
-            continue
-
-        fpk, _ = find_peaks(sig, distance=window)
-        if not len(fpk):
-            continue
-        _, lb, _rb = peak_prominences(sig, fpk)
-        cand = {}
-        for i, pi in enumerate(fpk):
-            if sig[pi] <= fiji_floor:
-                continue
-            if sig[pi] < sig[max(0, pi - window):min(len(sig), pi + window + 1)].max():
-                continue
-            base_l = max(sig[lb[i]], den_floor, eps)
-            if sig[pi] / base_l >= fiji_fold:
-                cand[int(pi)] = 'fiji'
-
-        episodes, cur_peak, last_i, reset = [], -np.inf, None, fiji_floor
-        for pi in sorted(cand):
-            if (last_i is None
-                    or sig[last_i:pi + 1].min() < reset
-                    or sig[pi] > cur_peak * fiji_fold):
-                episodes.append([])
-                cur_peak = sig[pi]
-                # The ratio analogue of "returned to baseline", as for the fold routes:
-                # fall back by the factor that qualified the peak. Never `fiji_floor` alone,
-                # which a decaying hump sits above for many frames and would reopen an
-                # episode on every wobble.
-                reset = max(sig[pi] / fiji_fold, fiji_floor)
-            episodes[-1].append(pi)
-            last_i = pi
-
-        for ep in episodes:
-            pi = min(ep, key=lambda p: (ROUTE_RANK[cand[p]], p))
-            row = env.iloc[pi]
-            records.append({
-                'experiment_name': exp, 'FOV': fov, 'trench_id': trench,
-                'track_id': int(row['track_id']),
-                'predicted_lineage': row['predicted_lineage'],
-                'node_id': int(row['node_id']), 'time_frame': int(row['time_frame']),
-                'fluor': float(row[fluor_col]), 'gene': gene,
-                'threshold': float(fiji_floor), 'route': cand[pi],
-            })
-
-    cols = ['experiment_name', 'FOV', 'trench_id', 'track_id', 'predicted_lineage',
-            'node_id', 'time_frame', 'fluor', 'gene', 'threshold', 'route',
-            'is_constitutive']
-    if not records:
-        return pd.DataFrame(columns=cols)
-    bursts = pd.DataFrame(records)
-    bursts['is_constitutive'] = bursts['gene'].isin(constitutive_genes)
-    return bursts.reset_index(drop=True)
-
-
-def detect_bursts(df, k=4.0, window=5, min_prominence=None, fluor_col=FLUOR_COL,
-                  constitutive_genes=None, k_prom=None, baseline_cols=None,
-                  fold_prom=None, fold_height_floor_s=1.0, fold_left_prom=None,
-                  fold_base_floor_frac=0.5, fence_col=None, tukey_iqr_k=None):
-    """Detect fluorescence bursts on the per-group max-fluorescence envelope.
-
-    For each (experiment, FOV, trench) the brightest cell at each frame forms one continuous
-    signal (`trench_max_envelope`). Candidate peaks satisfy: (a) height > the gene x
-    experiment threshold `median + k * mad_scale`, (b) local maximum within +/- `window`
-    frames, and (c) prominence >= the required rise. Prominence is why flat-high constitutive
-    genes score ~0. Using the max envelope means a daughter's inherited fluorescence is part
-    of a decaying hump, so division carryover is not miscounted.
-
-    Episode merge (the key rule): a single burst that decays over many frames must count
-    ONCE, not once per wobble on the way down. Walking candidate peaks in time, a later peak
-    only opens a NEW burst when either the envelope first drops back below threshold (a reset
-    to baseline, then re-rises) OR it climbs to a genuinely higher new maximum
-    (> previous burst peak + the required prominence). Otherwise it is the same
-    decaying/plateauing burst and is skipped.
-
-    Callers pass the partition through `trench_id` -- see `run_burst_detection_any` -- so this
-    function is unchanged from v1 and needs no knowledge of families or spatial clusters.
-
     Args:
         df: per-cell-per-frame DataFrame (needs gene, experiment_name, FOV, trench_id,
             track_id, time_frame, node_id, predicted_lineage, fluor_col).
         k: robust z-score multiplier for the absolute height threshold.
         window: +/- frames for the local-maximum check and minimum peak separation.
-        min_prominence: absolute required rise; overrides `k_prom` when given.
         fluor_col: fluorescence column (default a.u./ms).
         constitutive_genes: optional set; only tags an 'is_constitutive' column.
-        k_prom: multiplier for the required prominence. None -> `k`, which is what v1-v3 do.
-        baseline_cols: ``(median_col, scale_col)`` to read the baseline from `df` instead of
-            recomputing it per (gene, experiment). This is how an alternative baseline SCOPE
-            is evaluated -- see `attach_kymograph_baselines`. The columns must be constant
-            within each detection group, which is asserted, because the threshold has to be
-            one number per envelope.
-        fold_prom: enables the v5 FOLD route as a second way in -- a peak whose
+        k_prom: multiplier for the required prominence. None -> `k`.
+        fold_prom: enables the FOLD route as a second way in -- a peak whose
             ``peak / max(left_base, right_base)`` reaches this ratio qualifies even when it
             never clears `height`. Unit-free, so one bar serves a 283x spread of gene
-            brightness. None (v1-v4) leaves the absolute rule as the only route.
+            brightness. None leaves the route off.
         fold_height_floor_s: on either ratio route, the peak must also sit this many
             MAD-scales above the gene median. Guards the ratio's denominator.
-        fold_left_prom: enables the v6 FOLD-LEFT route -- the same ratio taken against the
+        fold_left_prom: enables the FOLD-LEFT route -- the same ratio taken against the
             LEFT base alone. ``max(left, right)`` binds on the right whenever a burst's decay
             has not returned to its pre-burst floor, which is the normal case here (the decay
             is dilution by growth, not protein loss), so the max-base rule systematically
-            penalises long-decay events: of the 84 peaks v3 rejected on prominence, the right
-            base decides 53. None (v1-v5) leaves this route off.
+            penalises long-decay events. None leaves this route off.
         fold_base_floor_frac: floors the fold-left denominator at this fraction of the
             baseline median. NOT optional: unfloored, a near-zero left base manufactures an
             arbitrary ratio (chpS 010/46 scores 30x on a left_base of 0.006). Bracketed on
             both sides at 0.5 -- 0.25 leaves the controls loose, 0.75 rises above the
             motivating case's own left base and loses it.
+        fence_col: a column carrying each row's own TRENCH's Tukey fence (see
+            `attach_kymograph_fence`); enables the TUKEY route. Read as a column because
+            by now `trench_id` is a family x cluster subgroup, so a fence computed here
+            would be per-family, not per-trench.
 
-    The routes are OR'd, and every row carries `route` ('absolute', 'fold' or 'fold_left')
-    recording which admitted it. Neither ratio route substitutes for the absolute rule:
+    The routes are OR'd, and every row carries `route` ('absolute', 'fold', 'fold_left' or
+    'tukey') recording which admitted it. Neither ratio route substitutes for the absolute rule:
     measured, fold alone finds 67 events and fails all three regression trenches, because it
-    misses the bright canonical bursts. They only ever add, which is what makes each version
-    a strict superset of the last.
-
-    Returns:
-        DataFrame with one row per burst event: experiment_name, FOV, trench_id, track_id,
-        predicted_lineage, node_id, time_frame, fluor, gene, threshold, route,
-        is_constitutive.
-        (track_id / node_id / predicted_lineage identify the brightest cell at the peak.)
+    misses the bright canonical bursts. They only ever add.
     """
-    baselines = None if baseline_cols else compute_baselines(df, fluor_col=fluor_col)
+    baselines = compute_baselines(df, fluor_col=fluor_col)
     constitutive_genes = constitutive_genes or set()
     kp = k if k_prom is None else k_prom
     records = []
 
     for (exp, fov, trench), df_trench in df.groupby(['experiment_name', 'FOV', 'trench_id']):
         gene = df_trench['gene'].iloc[0]
-        if baseline_cols:
-            med_col, scale_col = baseline_cols
-            med = df_trench[med_col].iloc[0]
-            scale = df_trench[scale_col].iloc[0]
-            # <= 1, not == 1: an all-NaN group (a trench with no usable scale) gives
-            # nunique() == 0 and used to trip this assert BEFORE the isfinite guard below
-            # could skip it. Varying values still give >= 2 and still raise.
-            assert df_trench[med_col].nunique() <= 1 and df_trench[scale_col].nunique() <= 1, (
-                f'{baseline_cols} vary within {exp} {fov}/{trench}; a detection group must '
-                'have one threshold')
-            if not np.isfinite(med) or not np.isfinite(scale):
-                continue
-        else:
-            if (gene, exp) not in baselines.index:
-                continue
-            med = baselines.loc[(gene, exp), 'median']
-            scale = baselines.loc[(gene, exp), 'mad_scale']
+        if (gene, exp) not in baselines.index:
+            continue
+        med = baselines.loc[(gene, exp), 'median']
+        scale = baselines.loc[(gene, exp), 'mad_scale']
         height = med + k * scale
-        prom = kp * scale if min_prominence is None else min_prominence
+        prom = kp * scale
 
-        # The trench's own Tukey fence, for the v7 route. Read as a COLUMN rather than
-        # recomputed here, for the same reason `baseline_cols` is: by the time this loop runs,
-        # `trench_id` has been rewritten to trench#partition (run_burst_detection_any), so
-        # `df_trench` is a lineage-family x spatial-cluster subgroup and a fence computed from
-        # it would be per-FAMILY, not per-trench. A pre-attached column is the only way to get
-        # a genuine per-kymograph number in here. Constant within the group by construction,
-        # since every partition subgroup is a subset of one trench -- asserted anyway.
         fence = None
-        if fence_col is not None and tukey_iqr_k is not None:
+        if fence_col is not None:
             assert df_trench[fence_col].nunique() == 1, (
                 f'{fence_col} varies within {exp} {fov}/{trench}; a detection group must have '
                 'one fence')
@@ -1128,44 +637,25 @@ def detect_bursts(df, k=4.0, window=5, min_prominence=None, fluor_col=FLUOR_COL,
             continue
 
         peaks, _ = find_peaks(sig, height=height, distance=window, prominence=prom)
-        # explicit +/- window local-maximum check on the envelope
         cand = {int(pi): 'absolute' for pi in peaks
                 if sig[pi] >= sig[max(0, pi - window):min(len(sig), pi + window + 1)].max()}
 
-        # --- the fold route (v5) -------------------------------------------------------
-        # A second way in, for a peak that is large RELATIVE to its own surroundings but
-        # small in absolute terms because its whole trench sits below the gene median. Such
-        # a trench can never clear `height`, so the absolute route discards it before
-        # prominence is ever evaluated -- see the v5 changelog entry for the worked case.
-        # v6 adds a third route on the same peaks, dividing by the LEFT base only. Order
-        # matters and is the whole mechanism: `setdefault` never overwrites, so trying
-        # 'fold' before 'fold_left' labels a peak with the strongest route that admits it.
         if fold_prom is not None or fold_left_prom is not None or fence is not None:
             fpk, _ = find_peaks(sig, distance=window)
             if len(fpk):
                 _, lb, rb = peak_prominences(sig, fpk)
                 floor = med + fold_height_floor_s * scale
-                # Flooring the denominator is what keeps the left-base route safe: an
-                # unfloored near-zero base turns a noise wobble into an arbitrary ratio.
+                
                 den_floor = fold_base_floor_frac * med
                 for i, pi in enumerate(fpk):
                     if sig[pi] < sig[max(0, pi - window):min(len(sig), pi + window + 1)].max():
                         continue
-                    # --- the tukey route (v7) ---------------------------------------------
-                    # Evaluated HERE, above the `floor` test, and that placement is
-                    # load-bearing. `floor` is `med + fold_height_floor_s*scale`: a HEIGHT
-                    # condition on the gene baseline. The entire claim for the fence is that it
-                    # reaches peaks no height bar reaches, so inheriting the floor would defeat
-                    # it -- measured, it costs exactly the two near-misses v7 exists for.
-                    # `setdefault` is called after the fold routes below, so a peak they admit
-                    # keeps the stronger label; this only records the route, it does not gate.
                     _tukey_hit = fence is not None and sig[pi] > fence
                     if sig[pi] < floor:
                         if _tukey_hit:
                             cand.setdefault(int(pi), 'tukey')
                         continue
-                    # The floor guards the denominator: fold divides by `base`, and a noise
-                    # wobble in a near-zero trench would otherwise manufacture a huge ratio.
+
                     if fold_prom is not None:
                         base = max(sig[lb[i]], sig[rb[i]])
                         if base > 0 and sig[pi] / base >= fold_prom:
@@ -1174,40 +664,18 @@ def detect_bursts(df, k=4.0, window=5, min_prominence=None, fluor_col=FLUOR_COL,
                         base_l = max(sig[lb[i]], den_floor)
                         if base_l > 0 and sig[pi] / base_l >= fold_left_prom:
                             cand.setdefault(int(pi), 'fold_left')
-                    # Last, so 'absolute' < 'fold' < 'fold_left' < 'tukey' all keep priority.
                     if _tukey_hit:
                         cand.setdefault(int(pi), 'tukey')
 
-        # episode merge: collapse a decaying burst to a single event.
-        #
-        # Two passes: group the candidates into episodes, then choose one representative
-        # frame per episode. v1-v4 have a single route, so the ROUTE_RANK ordering below is
-        # uniformly 0 and "strongest, then earliest" is just "earliest" -- bit-identical to
-        # the original single-pass loop.
         episodes, cur_peak, last_i, reset = [], -np.inf, None, height
         for pi in sorted(cand):
             route = cand[pi]
-            if (last_i is None                              # first candidate
-                    or sig[last_i:pi + 1].min() < reset     # returned to baseline -> reset
-                    or sig[pi] > cur_peak + prom):          # climbed to a higher maximum
+            if (last_i is None                              
+                    or sig[last_i:pi + 1].min() < reset     
+                    or sig[pi] > cur_peak + prom):          
                 episodes.append([])
                 cur_peak = sig[pi]
-                # Route-appropriate reset floor. A ratio route's envelope never reaches
-                # `height`, so reusing it would make the reset test always true and reopen a
-                # new burst on every wobble of the decay. Requiring the envelope to fall
-                # back by the factor that qualified the peak is the ratio analogue of
-                # "returned to baseline", so each route resets on its own divisor. Measured
-                # INERT on this dataset (same 118 events for v5 either way), like `window`;
-                # kept because a long dim decaying hump is exactly what it guards, and that
-                # is a data property, not a rule property.
                 if route == 'tukey':
-                    # A fence has no qualifying FACTOR to fall back by, unlike fold /
-                    # fold_left, so the analogue of "returned to baseline" is "dropped back
-                    # below the trench's own fence" -- the same statement as `reset = height`
-                    # for the absolute route, with the trench fence substituted for the gene
-                    # bar. Leaving this out would fall through to `reset = height`, which a
-                    # tukey peak never reaches, making the reset test always true and reopening
-                    # a burst on every wobble of a decay: silently inflated counts, no error.
                     reset = fence
                 else:
                     _div = {'fold': fold_prom, 'fold_left': fold_left_prom}.get(route)
@@ -1216,13 +684,6 @@ def detect_bursts(df, k=4.0, window=5, min_prominence=None, fluor_col=FLUOR_COL,
             last_i = pi
 
         for ep in episodes:
-            # Represent the episode by its STRONGEST route, then the earliest frame
-            # (ROUTE_RANK: absolute < fold < fold_left). Without this, a ratio candidate on
-            # the rising shoulder opens the episode and then absorbs the genuine bright peak
-            # behind it -- in alkA 001/807 v4 reported frame 4 at 0.3583 and v5 would have
-            # reported frame 3 at 0.2457 instead, downgrading a real burst and mislabelling
-            # its route. This is what keeps **v5 a strict superset of v4 and v6 of v5**,
-            # which is the property that makes the definitions comparable at all.
             pi = min(ep, key=lambda p: (ROUTE_RANK[cand[p]], p))
             row = env.iloc[pi]
             records.append({
@@ -1243,11 +704,7 @@ def detect_bursts(df, k=4.0, window=5, min_prominence=None, fluor_col=FLUOR_COL,
     bursts['is_constitutive'] = bursts['gene'].isin(constitutive_genes)
     return bursts.reset_index(drop=True)
 
-
-# ---------------------------------------------------------------------------------------
-# v2 -- lineage families and the concurrent-burst merge
-# ---------------------------------------------------------------------------------------
-
+# creates lineage_family column to a cell table 
 def add_lineage_family(df):
     """Add a `lineage_family` column (root track_id within the trench) to a cell table."""
     df = df.sort_values(KYMO_KEY + ['track_id', 'time_frame']).reset_index(drop=True)
@@ -1258,27 +715,12 @@ def add_lineage_family(df):
     df['lineage_family'] = fam
     return df
 
+# merges two bursts if tracking is wrong and two different lineages overcount the same burst 
+# determines this if track_ids are not too far apart (~1.5 cell length apart)
+# determines earliest onset of burst as burst 
 
 def merge_concurrent_bursts(bursts, bdef=None):
-    """Collapse events that are the same burst seen in two lineage families.
-
-    Per-family detection separates genuinely concurrent bursts, but it also splits a single
-    burst across two ADJACENT cells the tracker put in different families -- e.g. tracks 44
-    and 45 of trench 1488, which are neighbours 1.41 cell lengths apart. Two events are the
-    same burst when their peaks are within `merge_window` frames AND their centroids are
-    within `merge_gap_cell_lengths` of each other.
-
-    The gap is measured in CELL LENGTHS, not pixels, for the same reason flag_jumps does it
-    (mmtrack/track_displacement.py): a cell-length unit is independent of magnification and
-    cell size. It is also an insensitive choice here -- 1.5, 2.0 and 2.5 all give the same
-    total, because the concurrent pairs in this dataset sit at <=1.06 or >=2.77 cell lengths.
-
-    `merge_keep='earliest'` reports the ONSET of the merged burst, so timing is not biased
-    late by whichever neighbour happened to peak brighter.
-
-    Returns (merged_bursts, audit) where `audit` has one row per concurrent pair considered.
-    """
-    bdef = BURST_DEF if bdef is None else bdef
+    bdef = BURST_DEF_V1 if bdef is None else bdef
     W = bdef['merge_window']
     GAP = bdef['merge_gap_cell_lengths']
     if bdef.get('merge_keep', 'earliest') != 'earliest':
@@ -1286,15 +728,6 @@ def merge_concurrent_bursts(bursts, bdef=None):
 
     drop, audit = set(), []
     for _, g in bursts.groupby(KYMO_KEY, observed=True):
-        # Earliest first, brighter first on ties: the survivor of a merge is the onset.
-        #
-        # From v5, an ABSOLUTE event outranks a fold one regardless of timing. Two routes can
-        # fire on neighbouring cells in different lineage families, and then plain
-        # onset-ordering keeps whichever came first -- in alkA 001/807 that meant a dim fold
-        # shoulder (frame 3, 0.2457) survived and the confirmed bright burst behind it
-        # (frame 4, 0.3583) was dropped, downgrading a real event and mislabelling its route.
-        # This ordering keeps **v5 a strict superset of v4**, and v6 of v5. It is
-        # bit-identical for v1-v4, where every event is 'absolute' and the rank is uniformly 0.
         ordered = sorted(g.itertuples(),
                          key=lambda r: (ROUTE_RANK[getattr(r, 'route', 'absolute')],
                                         r.time_frame, -r.fluor))
@@ -1325,11 +758,6 @@ def merge_concurrent_bursts(bursts, bdef=None):
     audit = (pd.DataFrame(audit, columns=cols).sort_values('gap_cell_lengths')
              if audit else pd.DataFrame(columns=cols))
     return bursts.drop(index=drop), audit.reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------------------
-# v3 -- spatial clusters inside a lineage family
-# ---------------------------------------------------------------------------------------
 
 def _spatial_clusters_one_frame(sub, split_gap):
     """Cluster one family's cells at one frame by gaps along y. Returns cluster index per row.
@@ -1365,7 +793,7 @@ def add_spatial_subgroup(df, bdef=None):
     Consecutive-frames-only is the safeguard against fusing two bursts that occupy the same y
     at different times: there is no chain of links between them because the region went dark.
     """
-    bdef = BURST_DEF_V3 if bdef is None else bdef
+    bdef = BURST_DEF_V1 if bdef is None else bdef
     split_gap = bdef['split_gap_cell_lengths']
     df = df.sort_values(KYMO_KEY + ['lineage_family', 'time_frame']).reset_index(drop=True)
     grp = np.empty(len(df), dtype=object)
@@ -1413,229 +841,11 @@ def add_spatial_subgroup(df, bdef=None):
     df['spatial_group'] = grp
     return df
 
-
-# ---------------------------------------------------------------------------------------
-# Dispatcher
-# ---------------------------------------------------------------------------------------
-
-def run_burst_detection_any(df, bdef, baseline_cols=None, fence_col=None):
-    """Detect bursts under any definition, returning (bursts, merge_audit).
-
-    Dispatches on the partition the definition asks for -- trench (v1), lineage family (v2),
-    or family x spatial cluster (v3/v4) -- by temporarily encoding the partition into
-    `trench_id`, which is what detect_bursts groups by. `trench_id` is restored before
-    returning, so select_trench keeps working on the result.
-    """
-    assert tuple(bdef['baseline_keys']) == ('gene', 'experiment_name'), (
-        'compute_baselines groups by (gene, experiment_name); a different baseline_keys in '
-        'the definition would not be honoured. Change the function, not just the dict.')
-    # A definition asking for the tukey route with no fence attached would silently return the
-    # previous version's event set -- the same class of silent no-op the baseline_keys assert
-    # above exists to prevent.
-    assert not (bdef.get('tukey_iqr_k') is not None and fence_col is None), (
-        f"{bdef['version']} asks for the tukey route but no fence_col was passed; it would "
-        'silently reproduce v6. Call attach_kymograph_fence first and pass its column.')
-    # v8 measures a different image, so it runs its own detector; detect_bursts and the
-    # frozen v1-v3 sets are untouched by it. Everything downstream (partition encoding,
-    # merge, audit) is shared.
-    fiji_mode = bdef.get('fiji_fold') is not None
-    # v9: any-signal + (time, y) clustering. Its own detector, and it returns before the
-    # lineage-family partition and merge_concurrent_bursts -- the clustering IS the
-    # deduplication, and running the concurrent merge on top would dedupe twice.
-    lit_mode = bdef.get('lit_gate') is not None
-    # v11: seeded clustering. Checked BEFORE lit_mode, because v11 carries a `lit_gate` too --
-    # it inherits v9's dict. `seed_rule` is what distinguishes them.
-    seed_mode = bdef.get('seed_rule') is not None
-    sig = bdef['signal']
-    # Which baseline the `threshold` column refers to. Load-bearing once one CSV carries
-    # definitions run under different scopes: a per-trench bar and a per-gene bar are not
-    # comparable numbers, and without this the column silently mixes them.
-    scope = 'kymograph' if baseline_cols else 'gene_experiment'
-    common = dict(k=bdef['k'], k_prom=bdef.get('k_prom'), window=bdef['window'],
-                  min_prominence=bdef['min_prominence'], fluor_col=bdef['fluor_col'],
-                  constitutive_genes=set(bdef['constitutive_genes']),
-                  baseline_cols=baseline_cols,
-                  fold_prom=bdef.get('fold_prom'),
-                  fold_height_floor_s=bdef.get('fold_height_floor_s', 1.0),
-                  fold_left_prom=bdef.get('fold_left_prom'),
-                  fold_base_floor_frac=bdef.get('fold_base_floor_frac', 0.5),
-                  fence_col=fence_col, tukey_iqr_k=bdef.get('tukey_iqr_k'))
-
-    if seed_mode:
-        assert '_lit_thresh' in df.columns and '_lit_rule' in df.columns, (
-            f"{bdef['version']} needs attach_lit_baseline_for(df, bdef) first")
-        _want = _lit_tag(bdef['seed_rule'], bdef.get('iqr_k', 1.5), bdef.get('k', 4.0),
-                         bdef.get('min_lit', 5), bdef.get('sparse_admit', True))
-        _got = df['_lit_rule'].iloc[0]
-        assert _got == _want, (
-            f"{bdef['version']} asks for the {_want!r} bar but the frame carries {_got!r}; "
-            'it would silently report a different definition\'s events. '
-            'Rebuild with attach_lit_baseline_for(df, bdef).')
-        common = dict(fluor_col=bdef['fluor_col'], lit_gate=bdef['lit_gate'],
-                      link_dt=bdef['link_dt'],
-                      link_dy_cell_lengths=bdef['link_dy_cell_lengths'],
-                      min_frames=bdef.get('min_frames', 1),
-                      frac_min=bdef.get('frac_min', 0.0),
-                      constitutive_genes=set(bdef['constitutive_genes']))
-        scope = 'lit_fence_trench'
-    elif lit_mode:
-        common = dict(fluor_col=bdef['fluor_col'], lit_gate=bdef['lit_gate'],
-                      link_dt=bdef['link_dt'],
-                      link_dy_cell_lengths=bdef['link_dy_cell_lengths'],
-                      min_cell_frames=bdef.get('min_cell_frames', 1),
-                      constitutive_genes=set(bdef['constitutive_genes']))
-        scope = 'lit_trench'
-    elif fiji_mode:
-        common = dict(fluor_col=bdef['fluor_col'], window=bdef['window'],
-                      fiji_fold=bdef['fiji_fold'],
-                      fiji_floor=bdef.get('fiji_floor', 0.0),
-                      fiji_max_activity=bdef.get('fiji_max_activity', np.inf),
-                      fiji_base_floor_frac=bdef.get('fiji_base_floor_frac', 0.05),
-                      constitutive_genes=set(bdef['constitutive_genes']))
-        scope = 'fiji_trench'
-    _detect = (detect_bursts_seeded if seed_mode
-               else detect_bursts_lit if lit_mode
-               else detect_bursts_fiji if fiji_mode else detect_bursts)
-
-    if sig.startswith('per-trench'):
-        b = _detect(df, **common)
-        b['def_version'] = bdef['version']
-        b['baseline_scope'] = scope
-        b['lineage_family'] = np.nan
-        return b, pd.DataFrame()
-
-    cells = add_lineage_family(df)
-    part = 'lineage_family'
-    if sig.startswith('per-lineage-family x spatial'):
-        cells = add_spatial_subgroup(cells, bdef)
-        part = 'spatial_group'
-
-    keyed = cells.copy()
-    keyed['trench_id'] = keyed['trench_id'].astype(str) + FAMILY_SEP + keyed[part].astype(str)
-    b = _detect(keyed, **common)
-    if b.empty:
-        b['def_version'] = bdef['version']
-        b['baseline_scope'] = scope
-        return b, pd.DataFrame()
-
-    split = b['trench_id'].str.rsplit(FAMILY_SEP, n=1, expand=True)
-    b['trench_id'] = split[0]
-    b['partition'] = split[1]
-    b['lineage_family'] = b['partition'].astype(str).str.split('.').str[0].astype(int)
-
-    # Position and size at the peak, for the merge. centroid_y is the true along-trench axis;
-    # centroid_x is kymograph-space and must never be used for distance (see CLAUDE.md).
-    pos = KYMO_KEY + ['track_id', 'time_frame']
-    b = b.merge(cells[pos + ['centroid_y', 'axis_major_length']], on=pos, how='left')
-    assert b['centroid_y'].notna().all(), 'a burst peak failed to match a cell row'
-    b, audit = merge_concurrent_bursts(b, bdef)
-    b['def_version'] = bdef['version']
-    b['baseline_scope'] = scope
-    return b.reset_index(drop=True), audit
-
-
-def attach_kymograph_baselines(df, fluor_col=FLUOR_COL, scope='kymograph',
-                               scale_floor_frac=0.25, med_col='_base_med',
-                               scale_col='_base_scale'):
-    """Attach a per-row baseline under an alternative SCOPE, for `detect_bursts`.
-
-    The shipped rule centres and scales per (gene, experiment). That is what makes thresholds
-    comparable across a 283x range of gene brightness -- but it is a POPULATION threshold
-    applied to a per-trench phenomenon, and measured, only **109 of 255 trenches (43%)** have
-    a brightest-ever cell-frame that reaches their own bar. The rest cannot register a burst
-    at all, very unevenly: 87% of lacZ trenches are eligible against 25% of baeS and 0% of
-    mazF, so the per-gene ranking is partly a statement about eligibility.
-
-    Scopes, all measured at k = 4.0 on the 20-experiment frame:
-
-    ==========================  =======  ========  =====================================
-    scope                       events   hupA/mazF notes
-    ==========================  =======  ========  =====================================
-    ``'gene_experiment'``            89  0.00/0.00 the shipped rule
-    ``'kymograph'``                 156  0.00/0.19 **breaks mazF** -- a quiet trench gets a
-                                                   tiny MAD and its own noise clears the bar
-    ``'kymograph_global_scale'``     89  0.00/0.00 local centre, global scale: no change
-    ``'kymograph'`` + floor 0.25    153  0.00/0.00 coverage 43% -> 59%, control intact
-    ==========================  =======  ========  =====================================
-
-    So the floor is not cosmetic: it is what stops the local scale collapsing on a trench
-    that never does anything. **None of these catch the two documented near-misses**, which
-    fail on prominence and shape rather than on the height offset -- a local scale larger
-    than the global one actually raises the prominence bar.
-
-    Args:
-        scope: ``'kymograph'`` (centre and scale both per trench),
-            ``'kymograph_global_scale'`` (centre per trench, scale per gene x experiment), or
-            ``'gene_experiment'`` (the shipped rule, attached as columns).
-        scale_floor_frac: floor the local scale at this fraction of the (gene, experiment)
-            scale. 0 disables the floor.
-
-    Returns a copy of `df` with the two baseline columns added.
-    """
-    glob = compute_baselines(df, fluor_col=fluor_col)
-    out = df.copy()
-    gkey = list(zip(out['gene'], out['experiment_name']))
-    g_med = np.array([glob['median'].get(k, np.nan) for k in gkey])
-    g_scale = np.array([glob['mad_scale'].get(k, np.nan) for k in gkey])
-
-    if scope == 'gene_experiment':
-        out[med_col], out[scale_col] = g_med, g_scale
-        return out
-
-    def _robust(x):
-        m = np.median(x)
-        return pd.Series({'median': m,
-                          'mad_scale': max(1.4826 * np.median(np.abs(x - m)), 1e-6)})
-
-    local = (out.groupby(KYMO_KEY, observed=True)[fluor_col]
-                .apply(lambda x: _robust(x.to_numpy())).unstack())
-    idx = pd.MultiIndex.from_arrays([out[c] for c in KYMO_KEY])
-    l_med = local['median'].reindex(idx).to_numpy()
-    l_scale = local['mad_scale'].reindex(idx).to_numpy()
-
-    out[med_col] = l_med
-    if scope == 'kymograph_global_scale':
-        out[scale_col] = g_scale
-    elif scope == 'kymograph':
-        out[scale_col] = (np.maximum(l_scale, scale_floor_frac * g_scale)
-                          if scale_floor_frac else l_scale)
-    else:
-        raise ValueError(f'unknown scope {scope!r}')
-    return out
-
+# runs the Tukey fence for detect_bursts 
+# This is a quartile fence rather than a location + scale bar 
+# Returns a copy of `df` with `fence_col` added.
 
 def attach_kymograph_fence(df, fluor_col=FLUOR_COL, iqr_k=4.0, fence_col='_tukey_fence'):
-    """Attach each row's own KYMOGRAPH's Tukey fence, `Q3 + iqr_k*IQR`, for `detect_bursts`.
-
-    Default `iqr_k` is **4.0**, matching `BURST_DEF_V7` -- not the textbook 1.5, which on this
-    data gives 523 events and breaks all three regression trenches. See V7's sweep table.
-
-    The v7 route's statistic. Same shape as `attach_kymograph_baselines` -- a per-trench number
-    broadcast onto every row of that trench -- because `detect_bursts` sees family x cluster
-    subgroups, not trenches, and so cannot compute a per-trench quantity itself.
-
-    **Why a quartile fence rather than another location+scale bar.** Every gate in v1-v6 is a
-    statement about the (gene, experiment) median: a height, or a ratio against a peak's own
-    flanks. Re-scoping that median to the trench was evaluated four times and shipped none of
-    them (`bursts.md` section 8). A fence is a statement about the SHAPE of one trench's own
-    distribution instead, and measured on cell-frames it reaches both documented near-misses
-    that no height bar reaches at any scope, while ranking the constitutive controls
-    hupA/mazF/chpS 8th/7th/6th of 10 by flagged fraction.
-
-    **Units are a trap here.** The fence must be computed on the SAME column the detector runs
-    on. Exposure is one constant per experiment, so raw and per-ms fences give identical
-    verdicts -- but the fences themselves differ by 150-500x, so a fence built on
-    `intensity_mean_fluor` and compared against `fluor_per_ms` is wrong by up to 500x and
-    produces no error. The default matches `detect_bursts`' default; pass `bdef['fluor_col']`
-    explicitly when driving it from a definition.
-
-    No degeneracy guard is needed on this dataset: measured, 0 of 255 kymographs have a zero
-    IQR, so the fence is always finite. `np.percentile`'s linear interpolation, and the caller
-    compares with strict `>`, both matching `figures._quantile_stats` so v7 and the notebook's
-    `kymo_threshold_table` cannot drift.
-
-    Returns a copy of `df` with `fence_col` added.
-    """
     out = df.copy()
 
     def _fence(x):
@@ -1650,179 +860,811 @@ def attach_kymograph_fence(df, fluor_col=FLUOR_COL, iqr_k=4.0, fence_col='_tukey
     return out
 
 
-def burst_coverage(df, bdef=None, baseline_cols=None):
-    """Per-trench eligibility: can this trench's brightest frame ever reach its height bar?
+def run_v1(clean, bdef=BURST_DEF_V1, verbose=True):
+    """v1's events on `clean` (see `clean_cells`). Returns `(events, concurrent_merge_audit)`.
 
-    A trench whose envelope never crosses the bar contributes only to the DENOMINATOR of
-    every burst rate, so the rates mix "does not burst" with "could not have been seen to
-    burst". `headroom_s` is how far the brightest frame sits above the bar in MAD-scales:
-    negative means structurally ineligible.
+    Attaches each trench's Tukey fence, partitions every trench into lineage family x spatial
+    cluster, detects on each partition's max envelope by encoding the partition into
+    `trench_id` (which is what `detect_bursts` groups by), restores `trench_id`, runs the
+    concurrent merge, and adds the along-trench position.
 
-    Returns one row per trench, with `n_families` so the trenches where v2/v3 degenerate to
-    v1 (22% of them are a single family) are visible too.
+    RE-RUN this after any change to the cell table, never filter its output: the height bar
+    is a (gene, experiment) median + MAD, so dropping one trench moves the bar for every
+    surviving trench of that gene in that experiment (excluding gfcE 001/2501 cost one event
+    in ANOTHER trench).
     """
-    bdef = BURST_DEF if bdef is None else bdef
-    fluor_col = bdef['fluor_col']
-    glob = None if baseline_cols else compute_baselines(df, fluor_col=fluor_col)
-    rows = []
-    for (exp, fov, trench), tr in df.groupby(KYMO_KEY, observed=True):
-        gene = tr['gene'].iloc[0]
-        if baseline_cols:
-            med, scale = (tr[baseline_cols[0]].iloc[0], tr[baseline_cols[1]].iloc[0])
-        else:
-            if (gene, exp) not in glob.index:
-                continue
-            med, scale = glob.loc[(gene, exp), ['median', 'mad_scale']]
-        if not np.isfinite(med) or not np.isfinite(scale):
-            continue
-        height = med + bdef['k'] * scale
-        fams = lineage_family_roots(tr)
-        tagged = tr.assign(_fam=[fams[int(t)] for t in tr['track_id']])
-        env_max = max(trench_max_envelope(g, fluor_col=fluor_col)[fluor_col].max()
-                      for _, g in tagged.groupby('_fam'))
-        rows.append({'gene': gene, 'experiment_name': exp, 'FOV': fov,
-                     'trench_id': trench, 'env_max': float(env_max),
-                     'bar': float(height), 'eligible': bool(env_max >= height),
-                     'headroom_s': float((env_max - height) / scale),
-                     'n_families': len(set(fams.values()))})
-    return pd.DataFrame(rows)
+    assert tuple(bdef['baseline_keys']) == ('gene', 'experiment_name'), (
+        'compute_baselines groups by (gene, experiment_name); change the function, not the dict')
+    fenced = attach_kymograph_fence(clean, fluor_col=bdef['fluor_col'],
+                                    iqr_k=bdef['tukey_iqr_k'], fence_col='_tukey_fence')
+    cells = add_spatial_subgroup(add_lineage_family(fenced), bdef)
+    keyed = cells.copy()
+    keyed['trench_id'] = (keyed['trench_id'].astype(str) + FAMILY_SEP
+                          + keyed['spatial_group'].astype(str))
+    b = detect_bursts(keyed, k=bdef['k'], k_prom=bdef['k_prom'], window=bdef['window'],
+                      fluor_col=bdef['fluor_col'],
+                      constitutive_genes=set(bdef['constitutive_genes']),
+                      fold_prom=bdef['fold_prom'],
+                      fold_height_floor_s=bdef['fold_height_floor_s'],
+                      fold_left_prom=bdef['fold_left_prom'],
+                      fold_base_floor_frac=bdef['fold_base_floor_frac'],
+                      fence_col='_tukey_fence')
+    split = b['trench_id'].str.rsplit(FAMILY_SEP, n=1, expand=True)
+    b['trench_id'] = split[0]
+    b['partition'] = split[1]
+    b['lineage_family'] = b['partition'].astype(str).str.split('.').str[0].astype(int)
+
+    # Position and size at the peak, for the merge. centroid_y is the true along-trench axis;
+    # centroid_x is kymograph-space and must never be used for distance.
+    b = b.merge(cells[FRAME_KEY + ['centroid_y', 'axis_major_length']], on=FRAME_KEY,
+                how='left')
+    assert b['centroid_y'].notna().all(), 'a burst peak failed to match a cell row'
+    b, audit = merge_concurrent_bursts(b, bdef)
+    b['def_version'] = bdef['version']
+    b['baseline_scope'] = 'gene_experiment'
+    b = add_relative_y(b.reset_index(drop=True), clean)
+    if verbose:
+        print(f'v1: {len(b)} events | routes {b["route"].value_counts().to_dict()}')
+    return b.assign(burst_v1=True), audit
 
 
-# ---------------------------------------------------------------------------------------
-# Audit: every candidate the detector looked at, and why it was rejected
-# ---------------------------------------------------------------------------------------
 
-def burst_candidates(df, bdef=None, fluor_col=None):
-    """Every height-clearing local maximum on the envelopes, with the reason for its verdict.
+# V2: normalizes just within one kymograph and uses manually labled bursts to train a 
+# gradient hist classifier to predict other bursts, also using fiji modified values 
 
-    `detect_bursts` returns only what passed. This returns the whole candidate set, so
-    "underperforming for some events" becomes a countable claim rather than an impression.
-    Measured on the 20-experiment frame under v3: 178 candidates, 94 pass, and **84 are
-    rejected by prominence alone** -- 34 of them at >=75% of the required prominence.
+FLUOR_COLS = ('fiji_mean', 'intensity_mean_fluor')
+FOLD_FLOOR_FRAC = 0.01
 
-    Prominence is computed three ways so the rule itself can be audited:
+def _safe_ratio(a, b, floor):
+    return np.asarray(a, dtype=float) / np.maximum(np.asarray(b, dtype=float), floor)
 
-    ==============  =====================================================================
-    ``prom_s``      the shipped rule: peak - max(left_base, right_base), in MAD-scales
-    ``prom_min_s``  peak - min(left_base, right_base)
-    ``prom_left_s`` peak - left_base, i.e. a causal "did it rise" reading
-    ==============  =====================================================================
+# creates features from a dataframe of one row per cell-frame
+# returns a copy with the feature columns added 
+def featurize(df, verbose=True):
+    d = df.copy()
+    d['track_id'] = d['track_id'].astype(int)
+    d['time_frame'] = d['time_frame'].astype(int)
+    d = d.sort_values(KYMO_KEY + ['track_id', 'time_frame']).reset_index(drop=True)
+    g = d.groupby(KYMO_KEY, sort=False)
+    feats = []
 
-    Both alternatives look more permissive and are worse: measured, they score hupA's
-    brightest flat-high wobble at 6.855 MAD-scales, *above* a real chpS burst at 6.061. Keep
-    the max-base rule and move the bar (`k_prom`) instead.
+    #within-trench normalisation: the block that already scores AUC ~0.95 
+    for c in FLUOR_COLS:
+        d[f'{c}__pct'] = g[c].rank(pct=True)
+        tmax = g[c].transform('max')
+        d[f'{c}__over_tmax'] = _safe_ratio(d[c], tmax, 1e-9)
+        lit = d[c].where(d['fiji_mean'] > 0)
+        lmed = lit.groupby([d[k] for k in KYMO_KEY]).transform('median')
+        lmad = (lit - lmed).abs().groupby([d[k] for k in KYMO_KEY]).transform('median')
+        d[f'{c}__over_litmed'] = _safe_ratio(d[c], lmed, 1e-6)
+        d[f'{c}__z_lit'] = _safe_ratio(d[c] - lmed, 1.4826 * lmad, 1e-6)
+        feats += [f'{c}__pct', f'{c}__over_tmax', f'{c}__over_litmed', f'{c}__z_lit']
+    # percentile among LIT values only
+    d['fiji_mean__lit_pct'] = (d['fiji_mean'].where(d['fiji_mean'] > 0)
+                               .groupby([d[k] for k in KYMO_KEY]).rank(pct=True)).fillna(0.0)
+    feats.append('fiji_mean__lit_pct')
 
-    `frames_to_end` is carried because a peak near the end of a recording has a truncated
-    right flank, so its prominence is measured against a plateau rather than a baseline.
+    #B. raw values and shape
+    d['fiji_max_over_mean'] = _safe_ratio(d['fiji_max'], d['fiji_mean'], 1e-6)
+    for c in ('fiji_mean', 'fiji_frac', 'fluor_per_ms', 'area', 'axis_major_length',
+              'fiji_max_over_mean'):
+        if c in d.columns:
+            feats.append(c)
 
-    Returns one row per candidate, sorted by descending `prom_ratio`.
+    #C. temporal, along the lineage
+    parts = []
+    for (_, _, _), gg in d.groupby(KYMO_KEY, sort=False):
+        sub = {}
+        for c in FLUOR_COLS:
+            for lag in (1, 2, 3):
+                sub[f'{c}__lag{lag}'] = _lineage_lag(gg, c, lag)
+            sub[f'{c}__bmax3'] = _lineage_window(gg, c, 3, 'max', 'back')
+            sub[f'{c}__bmed3'] = _lineage_window(gg, c, 3, 'median', 'back')
+            sub[f'{c}__bmed5'] = _lineage_window(gg, c, 5, 'median', 'back')
+            sub[f'{c}__fmax3'] = _lineage_window(gg, c, 3, 'max', 'fwd')
+        parts.append(pd.DataFrame(sub, index=gg.index))
+    T = pd.concat(parts).sort_index()
+    for c in FLUOR_COLS:
+        scale_c = g[c].transform('max').to_numpy()
+        # rise: how far above its own recent past, as a fraction of the trench's range
+        d[f'{c}__rise1'] = (d[c].to_numpy() - T[f'{c}__lag1'].to_numpy()) / np.maximum(scale_c, 1e-9)
+        d[f'{c}__rise3'] = (d[c].to_numpy() - T[f'{c}__bmax3'].to_numpy()) / np.maximum(scale_c, 1e-9)
+        # Unit-free fold against the trailing median -- the per-cell-frame `fold_left`.
+        # The denominator is floored at 5% of the TRENCH'S OWN scale, not at an epsilon.
+        # This is v1's `fold_base_floor_frac` lesson, and it is not optional: an eps floor
+        # lets a near-zero trailing median manufacture arbitrary fold (a depth-3 tree fitted
+        # on the eps version split at fold_back3 <= 3179, which is noise, not signal --
+        # exactly how chpS 010/46 scored 30x on a base of 0.006 before it was floored).
+        floor = FOLD_FLOOR_FRAC * np.maximum(scale_c, 1e-9)
+        d[f'{c}__fold_back3'] = np.asarray(d[c], dtype=float) / np.maximum(
+            T[f'{c}__bmed3'].to_numpy(), floor)
+        d[f'{c}__fold_back5'] = np.asarray(d[c], dtype=float) / np.maximum(
+            T[f'{c}__bmed5'].to_numpy(), floor)
+        # asymmetry: a burst rises fast and decays slowly, constitutive signal does neither
+        d[f'{c}__asym'] = ((d[c].to_numpy() - T[f'{c}__bmax3'].to_numpy())
+                           - (T[f'{c}__fmax3'].to_numpy() - d[c].to_numpy())) / np.maximum(scale_c, 1e-9)
+        feats += [f'{c}__rise1', f'{c}__rise3', f'{c}__fold_back3', f'{c}__fold_back5',
+                  f'{c}__asym']
+
+    # within-frame context
+    fg = d.groupby(KYMO_KEY + ['time_frame'], sort=False)
+    for c in FLUOR_COLS:
+        d[f'{c}__frame_pct'] = fg[c].rank(pct=True)
+        d[f'{c}__over_frame_max'] = _safe_ratio(d[c], fg[c].transform('max'), 1e-9)
+        feats += [f'{c}__frame_pct', f'{c}__over_frame_max']
+    d['n_cells_in_frame'] = fg['track_id'].transform('size')
+    d['cell_index_from_open_end'] = fg['centroid_y'].rank(method='first') - 1
+    feats += ['n_cells_in_frame', 'cell_index_from_open_end']
+
+    # E. trench context, and ABSOLUTE magnitude
+    # Every feature above is RELATIVE, 
+    d['trench_lit_frac'] = g['fiji_mean'].transform(lambda x: (x > 0).mean())
+    d['trench_n_frames'] = g['time_frame'].transform('nunique')
+    d['trench_fiji_max'] = g['fiji_mean'].transform('max')
+    d['trench_fiji_litn'] = g['fiji_mean'].transform(lambda x: (x > 0).sum())
+    d['trench_raw_max'] = g['intensity_mean_fluor'].transform('max')
+    d['trench_raw_med'] = g['intensity_mean_fluor'].transform('median')
+    feats += ['trench_lit_frac', 'trench_n_frames', 'trench_fiji_max', 'trench_fiji_litn',
+              'trench_raw_max', 'trench_raw_med']
+    for c in ('intensity_mean_fluor', 'intensity_max_fluor', 'fiji_max'):
+        if c in d.columns and c not in feats:
+            feats.append(c)
+
+    #F. cell-cycle position
+    tg = d.groupby(KYMO_KEY + ['track_id'], sort=False)
+    d['frames_since_birth'] = d['time_frame'] - tg['time_frame'].transform('min')
+    d['frames_to_track_end'] = tg['time_frame'].transform('max') - d['time_frame']
+    d['track_n_frames'] = tg['time_frame'].transform('nunique')
+    feats += ['frames_since_birth', 'frames_to_track_end', 'track_n_frames']
+
+    d.attrs['feature_cols'] = feats
+    if verbose:
+        print(f'featurize: {len(d):,} cell-frames x {len(feats)} features')
+    return d
+
+
+# Event linking: one burst and its decay tail become one event, reported at its highest-scoring
+# frame.
+LINK_DT = 3                     # frames
+LINK_SLACK_CELL_LENGTHS = 1.5   # fixed y slack, in cell lengths
+LINK_DRIFT_PX = 10.0            # ... plus this much per frame of gap
+
+
+def score_to_events(df, threshold, link_dt=LINK_DT, slack=LINK_SLACK_CELL_LENGTHS,
+                    drift=LINK_DRIFT_PX):
+    """Collapse scored cell-frames into events, reported at the highest-scoring frame.
+
+    A burst and its decay tail become one event; two bursts at opposite ends of a trench stay
+    two. See `_link_ty_capped` for the tolerance.
+
+    `df` needs `score`, `centroid_y`, `axis_major_length` and the cell key.
     """
-    bdef = BURST_DEF if bdef is None else bdef
-    fluor_col = bdef['fluor_col'] if fluor_col is None else fluor_col
-    k, kp, window = bdef['k'], prom_multiplier(bdef), bdef['window']
-    fold_bar = bdef.get('fold_prom')
-    fold_left_bar = bdef.get('fold_left_prom')
-    den_frac = bdef.get('fold_base_floor_frac', 0.5)
-    floor_s = bdef.get('fold_height_floor_s', 1.0)
-    baselines = compute_baselines(df, fluor_col=fluor_col)
+    out = []
+    hot = df[df['score'] >= threshold]
+    for (e, f, t), g in hot.groupby(KYMO_KEY, sort=False):
+        L = float(df[(df.experiment_name == e) & (df.FOV == f)
+                     & (df.trench_id == t)]['axis_major_length'].median())
+        L = L if np.isfinite(L) and L > 0 else 1.0
+        gg = g.sort_values('time_frame').reset_index(drop=True)
+        gg['_ev'] = _link_ty_capped(gg['time_frame'].to_numpy(),
+                                    gg['centroid_y'].to_numpy(), slack * L, drift, link_dt)
+        for _, ev in gg.groupby('_ev', sort=False):
+            pk = ev.loc[ev['score'].idxmax()]
+            out.append({'experiment_name': e, 'FOV': f, 'trench_id': t,
+                        'track_id': int(pk['track_id']), 'time_frame': int(pk['time_frame']),
+                        'score': float(pk['score']), 'gene': pk.get('gene'),
+                        'n_cell_frames': int(len(ev)),
+                        'n_frames': int(ev['time_frame'].nunique()),
+                        'first_frame': int(ev['time_frame'].min()),
+                        'last_frame': int(ev['time_frame'].max())})
+    cols = ['experiment_name', 'FOV', 'trench_id', 'track_id', 'time_frame', 'score', 'gene',
+            'n_cell_frames', 'n_frames', 'first_frame', 'last_frame']
+    return pd.DataFrame(out, columns=cols)
 
-    rows = []
-    for (exp, fov, trench), tr in df.groupby(KYMO_KEY, observed=True):
-        gene = tr['gene'].iloc[0]
-        if (gene, exp) not in baselines.index:
+
+def run_v2(clean, fiji, model_path=INPUTS['v2_model'], verbose=True):
+    """v2's events: featurize every cell-frame, score with the SHIPPED model, link at 0.75.
+
+    The model is LOADED, never refitted. It was fitted on 203 lacZ/gfcE hand labels from
+    `data/bursts_lacZ_gfcE_091026.csv` (60 exhaustively reviewed trenches, decay tail masked
+    at +-8 frames, `StratifiedGroupKFold` by trench, threshold 0.75 = max out-of-fold F1)
+    BEFORE three of those labels were found to be mislabels (`KNOWN_MISLABELS`) and before
+    two trenches were excluded (`FAILED_KYMOGRAPHS`). A refit today trains on different rows
+    and would not reproduce these 1,041 events, so the joblib is a frozen input.
+
+    Scored on `clean`, which already lacks the excluded trenches; because every feature is
+    within-trench that gives exactly the events of scoring everything and dropping them
+    afterwards.
+    """
+    import joblib
+    M = joblib.load(model_path)
+    X = featurize(clean.merge(fiji, on=FRAME_KEY, how='left'), verbose=False)
+    X['score'] = M['model'].predict_proba(X[M['feature_cols']].to_numpy(dtype=float))[:, 1]
+    ev = score_to_events(X, M['threshold'])
+    ev.insert(5, 'burst_v2', True)
+    if verbose:
+        print(f'v2: {len(ev)} events at threshold {M["threshold"]} '
+              f'({len(M["feature_cols"])} features, {model_path})')
+    return ev, X
+
+
+# V3: similar to V2 is a trained classifier but uses more training data this time around 
+# No trench is scored by a model that saw it, an attempt was made to make features of model 
+# something that could be explained by data/physical phenomena. Also uses fiji_mean values 
+# instead of raw values 
+
+F_FIJI = 't_fiji'             # v3's name for `fiji_mean` (it was read from an identical copy)
+V3_MASK_WINDOW = 3            # +-frames of decay tail dropped from the loss; nearly inert
+V3_THRESHOLD = 0.90           # best out-of-fold event F1 on dev
+V3_DRIFT = 10.0               # px/frame in the event linker (median drift 6.56, p90 18.55)
+V3_SEED = 0
+SPLIT_SEED = 20261002
+SPLIT_TEST_FRAC = 0.25
+DECAY_K = 5                   # forward horizon, in frames, for the DECAY block
+
+ 
+def make_splits(tindex, labels, test_frac=0.25, seed=20261002, n_tries=4000):
+    """Hold out whole trenches, stratified by gene, ~`test_frac` of each gene's LABELS.
+
+    Returns `tindex` plus `split` ('dev'/'test') and `n_labels`. Only reviewed-gene trenches
+    are split; mazF/hupA get `split = 'unreviewable'` and are in neither.
+
+    WHOLE TRENCHES, because cell-frames in a trench share a baseline, a clip floor and usually
+    a lineage -- a random cell-frame split trains and tests on the same burst. The GNN's
+    time-based split does exactly that and was deliberately not copied.
+
+    Stratified on LABELS rather than trenches, because trenches carry 1-13 labels each and a
+    trench-count split would put wildly different numbers of positives on the two sides. The
+    search is a randomised one: `n_tries` shuffled greedy fills per gene, keeping the fill
+    whose test label share lands closest to `test_frac`. A single shuffle overshoots badly on
+    the small genes -- lacZ's target is 17.5 labels against trenches holding up to 13.
+
+    Certified-empty trenches (reviewed gene, zero labels) are split in the same proportion so
+    the holdout can measure false positives on confirmed-empty ground.
+    """
+    out = tindex.copy()
+    n_lab = labels.groupby(KYMO_KEY).size()
+    out['n_labels'] = (out.set_index(KYMO_KEY).index.map(n_lab)
+                       .to_series(index=out.index).fillna(0).astype(int))
+    out['split'] = 'unreviewable'
+
+    rng = np.random.default_rng(seed)
+    for gene in REVIEWED_GENES:
+        sub = out[(out['gene'] == gene) & out['reviewed']]
+        lab_tr = sub[sub['n_labels'] > 0]
+        emp_tr = sub[sub['n_labels'] == 0]
+
+        target = test_frac * lab_tr['n_labels'].sum()
+        best, best_err = None, np.inf
+        order_pool = lab_tr.index.to_numpy()
+        counts = lab_tr['n_labels'].to_numpy()
+        pos = {ix: i for i, ix in enumerate(order_pool)}
+        for _ in range(n_tries):
+            order = rng.permutation(order_pool)
+            tot, pick = 0, []
+            for ix in order:
+                if tot >= target:
+                    break
+                pick.append(ix)
+                tot += counts[pos[ix]]
+            err = abs(tot - target)
+            if err < best_err:
+                best, best_err = list(pick), err
+        out.loc[best, 'split'] = 'test'
+        out.loc[[i for i in lab_tr.index if i not in set(best)], 'split'] = 'dev'
+
+        n_emp_test = int(round(test_frac * len(emp_tr)))
+        if len(emp_tr):
+            etest = rng.choice(emp_tr.index.to_numpy(), size=n_emp_test, replace=False)
+            out.loc[emp_tr.index, 'split'] = 'dev'
+            out.loc[etest, 'split'] = 'test'
+
+    return out
+
+def _lineage_forward_trace(g, fcol, acol, k):
+    """Walk FORWARD along the lineage and return, per row, two traces of length `k`.
+
+    `fmax[i, j]` is the maximum of `fcol` over every descendant alive `j+1` frames later;
+    `asum[i, j]` is the SUM of `acol` over those same cells. NaN once the frontier dies.
+
+    The two aggregators are different ON PURPOSE and it is the whole physical content of the
+    DECAY block:
+
+      * fluorescence is a CONCENTRATION, so the right summary across daughters is the MAXIMUM
+        -- if either daughter is still bright, the signal has not gone away. A mean would be
+        diluted by however many cells happen to be present, which is the same argument v1 uses
+        for its max envelope (`bursts.md` section 3.1).
+      * area is an EXTENSIVE quantity, so the right summary is the SUM. A dividing cell's two
+        daughters together occupy about what the parent did, so the sum is the volume the
+        original protein is now spread through.
+
+    Together they let the fall be separated from the dilution that growth alone would cause:
+    if C = N/V with N fixed, then d(ln C)/dt = -d(ln V)/dt exactly. A burst that falls only at
+    that rate is one synthesis event being spread out; one that falls faster is losing protein.
+    Nothing in v1 or v2 measures this.
+    """
+    idx, par, kid = _lineage_maps(g)
+    fv = g[fcol].to_numpy(dtype=float)
+    av = g[acol].to_numpy(dtype=float)
+    tr = g['track_id'].to_numpy().astype(int)
+    fr = g['time_frame'].to_numpy().astype(int)
+    n = len(g)
+    fmax = np.full((n, k), np.nan)
+    asum = np.full((n, k), np.nan)
+    for i in range(n):
+        front = [(int(tr[i]), int(fr[i]))]
+        for j in range(k):
+            nxt = []
+            for t, f in front:
+                if (t, f + 1) in idx:
+                    nxt.append((t, f + 1))
+                else:
+                    nxt += [(c, f + 1) for c in kid.get(t, []) if (c, f + 1) in idx]
+            if not nxt:
+                break
+            cells = [idx[c] for c in nxt]
+            fmax[i, j] = np.nanmax(fv[cells])
+            asum[i, j] = np.nansum(av[cells])
+            front = nxt
+    return fmax, asum
+
+def _loglin_slope(y):
+    """Least-squares slope of ln(y) against t, over the finite, strictly positive entries.
+
+    `y` is (n, m) with t = 0, 1, ... along axis 1. Returns (n,) of slopes, NaN where fewer
+    than 3 usable points remain. Working in logs is what makes the two slopes comparable:
+    an exponential decay and an exponential growth become two numbers on the same scale, and
+    their sum is the excess that is not explained by dilution.
+    """
+    n, m = y.shape
+    t = np.arange(m, dtype=float)
+    out = np.full(n, np.nan)
+    with np.errstate(all='ignore'):
+        ly = np.log(np.where(y > 0, y, np.nan))
+    for i in range(n):
+        ok = np.isfinite(ly[i])
+        if ok.sum() < 3:
             continue
-        med, s = baselines.loc[(gene, exp), ['median', 'mad_scale']]
-        height, req = med + k * s, kp * s
-        tr = tr.sort_values('time_frame')
-        fams = lineage_family_roots(tr)
-        tagged = tr.assign(_fam=[fams[int(t)] for t in tr['track_id']])
+        tt, yy = t[ok], ly[i][ok]
+        tm, ym = tt.mean(), yy.mean()
+        den = float(((tt - tm) ** 2).sum())
+        if den <= 0:
+            continue
+        out[i] = float(((tt - tm) * (yy - ym)).sum() / den)
+    return out
 
-        for fam, g in tagged.groupby('_fam'):
-            env = trench_max_envelope(g, fluor_col=fluor_col)
-            sig = env[fluor_col].to_numpy()
-            if len(sig) < 3:
+# featurization for V3, tried to be grouped into physically-named blocks 
+# normalization should be within trench instead of globally 
+# this can include how bright a cell is relatyive to its trench, Rise, decay, neighbor, shape, and cycle 
+def build_features_v3(d, k_decay=DECAY_K, verbose=True):
+    
+    d = d.sort_values(KYMO_KEY + ['track_id', 'time_frame']).reset_index(drop=True).copy()
+    g = d.groupby(KYMO_KEY, sort=False)
+    blocks = {b: [] for b in ('LEVEL', 'RISE', 'DECAY', 'NEIGHBOUR', 'SHAPE', 'CYCLE')}
+
+    def add(block, name, values):
+        d[name] = values
+        blocks[block].append(name)
+
+    # per-trench anchors 
+    tmax_F = g[F_RAW].transform('max')
+    tmed_F = g[F_RAW].transform('median')
+    tmad_F = g[F_RAW].transform(lambda s: np.median(np.abs(s - np.median(s))))
+    scale_F = np.maximum(1.4826 * tmad_F, 1e-9)
+    tmax_J = g[F_FIJI].transform('max')
+    floor_F = FOLD_FLOOR_FRAC * np.maximum(tmax_F, 1e-9)
+    floor_J = FOLD_FLOOR_FRAC * np.maximum(tmax_J, 1e-9)
+
+    # LEVEL 
+    add('LEVEL', 'F__pct', g[F_RAW].rank(pct=True))
+    add('LEVEL', 'F__over_tmax', d[F_RAW] / np.maximum(tmax_F, 1e-9))
+    add('LEVEL', 'F__over_tmed', d[F_RAW] / np.maximum(tmed_F, floor_F))
+    add('LEVEL', 'F__z_trench', (d[F_RAW] - tmed_F) / scale_F)
+    add('LEVEL', 'J__pct', g[F_FIJI].rank(pct=True))
+    add('LEVEL', 'J__over_tmax', d[F_FIJI] / np.maximum(tmax_J, 1e-9))
+    # absolute magnitude the only features carrying a scale
+    add('LEVEL', 'F_abs', d[F_RAW])
+    add('LEVEL', 'trench_F_max', tmax_F)
+    add('LEVEL', 'trench_F_med', tmed_F)
+    add('LEVEL', 'trench_J_max', tmax_J)
+
+    # RISE and DECAY: the lineage walks 
+    n = len(d)
+    cols = {c: np.full(n, np.nan) for c in (
+        'F_lag1', 'F_bmax3', 'F_bmed3', 'F_bmed5', 'J_bmed3',
+        'F_fmax1', 'F_fmax3', 'F_fmax5', 'F_fmed3', 'slope_f', 'slope_a')}
+    for key, idxs in g.indices.items():
+        sub = d.iloc[idxs]
+        cols['F_lag1'][idxs] = _lineage_lag(sub, F_RAW, 1)
+        cols['F_bmax3'][idxs] = _lineage_window(sub, F_RAW, 3, 'max', 'back')
+        cols['F_bmed3'][idxs] = _lineage_window(sub, F_RAW, 3, 'median', 'back')
+        cols['F_bmed5'][idxs] = _lineage_window(sub, F_RAW, 5, 'median', 'back')
+        cols['J_bmed3'][idxs] = _lineage_window(sub, F_FIJI, 3, 'median', 'back')
+        fmax, asum = _lineage_forward_trace(sub, F_RAW, 'area', k_decay)
+        cols['F_fmax1'][idxs] = fmax[:, 0]
+        cols['F_fmax3'][idxs] = np.nanmax(fmax[:, :3], axis=1)
+        cols['F_fmax5'][idxs] = np.nanmax(fmax, axis=1)
+        cols['F_fmed3'][idxs] = np.nanmedian(fmax[:, :3], axis=1)
+        # the two log-slopes, anchored on the cell itself at t = 0
+        f_ser = np.column_stack([sub[F_RAW].to_numpy(dtype=float), fmax])
+        a_ser = np.column_stack([sub['area'].to_numpy(dtype=float), asum])
+        cols['slope_f'][idxs] = _loglin_slope(f_ser)
+        cols['slope_a'][idxs] = _loglin_slope(a_ser)
+    if verbose:
+        print(f'  lineage walks done over {len(g.indices)} trenches')
+
+    x = d[F_RAW].to_numpy(dtype=float)
+    add('RISE', 'F__rise1', (x - cols['F_lag1']) / scale_F)
+    add('RISE', 'F__rise3', (x - cols['F_bmax3']) / scale_F)
+    add('RISE', 'F__fold_back3', x / np.maximum(cols['F_bmed3'], floor_F))
+    add('RISE', 'F__fold_back5', x / np.maximum(cols['F_bmed5'], floor_F))
+    add('RISE', 'J__fold_back3', d[F_FIJI] / np.maximum(cols['J_bmed3'], floor_J))
+
+    add('DECAY', 'F__drop1', (x - cols['F_fmax1']) / scale_F)
+    add('DECAY', 'F__drop3', (x - cols['F_fmax3']) / scale_F)
+    add('DECAY', 'F__drop5', (x - cols['F_fmax5']) / scale_F)
+    add('DECAY', 'F__fold_fwd3', x / np.maximum(cols['F_fmed3'], floor_F))
+    add('DECAY', 'F__asym3', ((x - cols['F_bmax3']) - (cols['F_fmax3'] - x)) / scale_F)
+    # the physics: C = N/V, so pure dilution gives d(ln C)/dt = -d(ln V)/dt exactly.
+    add('DECAY', 'decay_rate', -cols['slope_f'])
+    add('DECAY', 'dilution_rate', cols['slope_a'])
+    add('DECAY', 'decay_excess', -cols['slope_f'] - cols['slope_a'])
+
+    # NEIGHBOUR 
+    fg = d.groupby(KYMO_KEY + ['time_frame'], sort=False)
+    nif = fg[F_RAW].transform('size')
+    add('NEIGHBOUR', 'F__frame_pct', fg[F_RAW].rank(pct=True))
+    add('NEIGHBOUR', 'J__frame_pct', fg[F_FIJI].rank(pct=True))
+    add('NEIGHBOUR', 'F__over_frame_max', x / np.maximum(fg[F_RAW].transform('max'), 1e-9))
+    # leave-one-out MEDIAN, not mean: with a mean aggregator the leave-one-out baseline is an
+    # exact rescale of the frame mean and not a new statistic (measured r = 0.995).
+    loo_med = fg[F_RAW].transform(
+        lambda s: s.median() if len(s) > 1 else np.nan)
+    add('NEIGHBOUR', 'F__over_frame_med', x / np.maximum(loo_med, floor_F))
+    dd = d.sort_values(KYMO_KEY + ['time_frame', 'centroid_y'])
+    ag = dd.groupby(KYMO_KEY + ['time_frame'], sort=False)[F_RAW]
+    adj = ((ag.shift(1) + ag.shift(-1)) / 2).combine_first(
+        ag.shift(1)).combine_first(ag.shift(-1)).reindex(d.index)
+    add('NEIGHBOUR', 'F__over_adjacent', x / np.maximum(adj.to_numpy(dtype=float), floor_F))
+    add('NEIGHBOUR', 'n_cells_in_frame', nif)
+
+    # SHAPE 
+    y_lo = g['centroid_y'].transform('min')
+    y_hi = g['centroid_y'].transform('max')
+    add('SHAPE', 'area', d['area'])
+    add('SHAPE', 'axis_major_length', d['axis_major_length'])
+    add('SHAPE', 'axis_minor_length', d['axis_minor_length'])
+    add('SHAPE', 'centroid_y_rel',
+        (d['centroid_y'] - y_lo) / np.maximum(y_hi - y_lo, 1e-9))
+    add('SHAPE', 'cell_index_from_open_end',
+        fg['centroid_y'].rank(method='first') - 1)
+
+    # CYCLE 
+    tg = d.groupby(KYMO_KEY + ['track_id'], sort=False)['time_frame']
+    first, last = tg.transform('min'), tg.transform('max')
+    add('CYCLE', 'frames_since_birth', d['time_frame'] - first)
+    add('CYCLE', 'frames_to_track_end', last - d['time_frame'])
+    add('CYCLE', 'track_n_frames', last - first + 1)
+    add('CYCLE', 'frac_through_track',
+        (d['time_frame'] - first) / np.maximum(last - first, 1))
+
+    feats = [c for b in blocks.values() for c in b]
+    d.attrs['blocks'] = blocks
+    d.attrs['feature_cols'] = feats
+    if verbose:
+        print(f'  {len(feats)} features in {len(blocks)} blocks: '
+              f'{ {b: len(v) for b, v in blocks.items()} }')
+    return d
+
+
+# Physically-defensible sign for every feature, for the monotone model (sklearn
+# `monotonic_cst`: +1 increasing, -1 decreasing, 0 unconstrained).
+# +1 means "more of this makes it MORE burst-like" and every one of them is a claim about the
+# physics 
+MONOTONE_SIGNS = {
+    'F__pct': 1, 'F__over_tmax': 1, 'F__over_tmed': 1, 'F__z_trench': 1,
+    'J__pct': 1, 'J__over_tmax': 1,
+    'F_abs': 1, 'trench_F_max': 1, 'trench_F_med': 0, 'trench_J_max': 1,
+    'F__rise1': 1, 'F__rise3': 1, 'F__fold_back3': 1, 'F__fold_back5': 1,
+    'J__fold_back3': 1,
+    'F__drop1': 1, 'F__drop3': 1, 'F__drop5': 1, 'F__fold_fwd3': 1, 'F__asym3': 1,
+    'decay_rate': 1, 'dilution_rate': 0, 'decay_excess': 1,
+    'F__frame_pct': 1, 'J__frame_pct': 1, 'F__over_frame_max': 1,
+    'F__over_frame_med': 1, 'F__over_adjacent': 1, 'n_cells_in_frame': 0,
+    'area': 0, 'axis_major_length': 0, 'axis_minor_length': 0,
+    'centroid_y_rel': 0, 'cell_index_from_open_end': 0,
+    'frames_since_birth': 0, 'frames_to_track_end': 0, 'track_n_frames': 0,
+    'frac_through_track': 0,
+}
+
+V3_MODEL_KW = dict(max_iter=300, learning_rate=0.06, max_leaf_nodes=15, min_samples_leaf=20,
+                   l2_regularization=1.0, class_weight='balanced')
+
+
+def make_model_v3(seed=0, monotone=None, feature_cols=None, **kw):
+    """`HistGradientBoostingClassifier`, optionally with a monotone constraint per feature.
+
+    sklearn's `monotonic_cst` takes +1/-1/0 in FEATURE ORDER, so it is built from
+    `MONOTONE_SIGNS` 
+    """
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    kws = {**V3_MODEL_KW, **kw}
+    if monotone:
+        missing = [c for c in feature_cols if c not in MONOTONE_SIGNS]
+        if missing:
+            raise ValueError(f'no monotone sign declared for {missing}')
+        kws['monotonic_cst'] = [MONOTONE_SIGNS[c] for c in feature_cols]
+    return HistGradientBoostingClassifier(random_state=seed, **kws)
+
+
+def cv_score_all(tt, feature_cols, n_splits=5, seed=0, shuffle_y=False, monotone=False,
+                 use_weights=False):
+    """Out-of-fold scores for EVERY row, grouped by trench. Returns `(scored, auc, ap)`.
+
+    Two things are deliberate:
+
+      * it TRAINS on `sample_weight > 0` rows but PREDICTS on every row of the held-out
+        trenches, including the decay-tail-masked ones. Masked rows are excluded from the
+        LOSS because their label is unknown, not because they do not exist -- leaving them
+        unscored punches holes in the middle of exactly the episodes being detected, and the
+        event linker then splits one burst into two.
+      * the group check is asserted on the actual split, per fold.
+
+    GROUPING BY TRENCH IS NOT OPTIONAL. Cell-frames in a trench share a baseline, a clip floor
+    and usually a lineage, so a random split trains and tests on the same burst. The GNN's
+    split is time-based and puts every trench in both halves; it was deliberately not copied.
+    """
+    from sklearn.metrics import average_precision_score, roc_auc_score
+    from sklearn.model_selection import StratifiedGroupKFold
+
+    tt = tt.reset_index(drop=True)
+    fit_mask = (tt['sample_weight'] > 0).to_numpy()
+    y = tt['y'].to_numpy().astype(int)
+    if shuffle_y:
+        rng = np.random.default_rng(seed)
+        y = y.copy()
+        y[fit_mask] = rng.permutation(y[fit_mask])
+    groups = tt['cv_group'].to_numpy()
+    X = tt[feature_cols]
+
+    oof = np.full(len(tt), np.nan)
+    fit_idx = np.flatnonzero(fit_mask)
+    skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    for tr, te in skf.split(fit_idx, y[fit_idx], groups[fit_idx]):
+        tr_i = fit_idx[tr]
+        tr_groups = set(groups[tr_i])
+        te_groups = set(groups[fit_idx[te]])
+        assert not (tr_groups & te_groups), 'a trench leaked across the split'
+        m = make_model_v3(seed=seed, monotone=monotone, feature_cols=feature_cols)
+        # `sample_weight` is used as a 0/1 mask; callers may pass graded weights instead
+        sw = tt['sample_weight'].to_numpy(dtype=float)[tr_i] if use_weights else None
+        m.fit(X.iloc[tr_i], y[tr_i], sample_weight=sw)
+        # predict on EVERY row of the held-out trenches, masked or not
+        pred_i = np.flatnonzero(np.isin(groups, list(te_groups)))
+        oof[pred_i] = m.predict_proba(X.iloc[pred_i])[:, 1]
+
+    # Score against `y`, which is the SHUFFLED vector when shuffle_y is set -- not against
+    # tt['y']. Scoring a noise-trained model against the TRUE labels measures anti-correlation
+    # and reports an AUC well below 0.5, which looks like a finding and is an artifact.
+    tt = tt.assign(score=oof)
+    keep = fit_mask & np.isfinite(oof)
+    return (tt, float(roc_auc_score(y[keep], oof[keep])),
+            float(average_precision_score(y[keep], oof[keep])))
+
+def build_training_table(cells, labels, reviewed, mask_window=3, verbose=True):
+    """Attach `y`, `sample_weight` and `cv_group` to every cell-frame in `reviewed` trenches.
+
+    y == 1   a labelled burst peak
+    y == 0   a confirmed negative -- reviewed trench, outside every decay mask
+    weight 0 inside a decay mask: within `mask_window` frames of a positive, on that
+             positive's own track OR any ancestor/descendant of it in the same trench.
+             These rows are neither positive nor negative and must not enter the loss.
+
+    `mask_window=0` disables masking and is almost certainly wrong: the labeller's own note is
+    that neighbouring frames still show signal because the decay is dilution by growth. Sweep
+    it; do not assume it.
+
+    `cv_group` is the trench. Every split downstream must group by it -- cell-frames within a
+    trench share a baseline, a clip floor and usually a lineage, so a random split leaks badly.
+    (The GNN's existing time-based split puts the same trench in train and test; do not copy it.)
+    """
+    keys = cells[KYMO_KEY].apply(tuple, axis=1)
+    pool = cells[keys.isin(reviewed)].copy()
+    pool['track_id'] = pool['track_id'].astype(int)
+    pool['time_frame'] = pool['time_frame'].astype(int)
+
+    pos = set(map(tuple, labels[FRAME_KEY].astype({'track_id': int, 'time_frame': int}).values))
+    pool['y'] = [tuple(r) in pos for r in
+                 pool[FRAME_KEY].astype({'track_id': int, 'time_frame': int}).values]
+    pool['y'] = pool['y'].astype(int)
+
+    mask = np.zeros(len(pool), dtype=bool)
+    if mask_window:
+        idx = {k: i for i, k in enumerate(map(tuple, pool[FRAME_KEY].values))}
+        for (exp, fov, tr), g in pool.groupby(KYMO_KEY, sort=False):
+            lab = labels[(labels.experiment_name == exp) & (labels.FOV == fov)
+                         & (labels.trench_id == tr)]
+            if lab.empty:
                 continue
-            # No height gate when a fold route is active: the whole point of that route is
-            # peaks that never clear `height`, and an audit that filtered them out could not
-            # show why they were or were not admitted.
-            peaks, _ = (find_peaks(sig) if (fold_bar or fold_left_bar)
-                        else find_peaks(sig, height=height))
-            if not len(peaks):
-                continue
-            # scipy's own bases, so the audit and the detector agree by construction
-            proms, lb, rb = peak_prominences(sig, peaks)
-            for i, pi in enumerate(peaks):
-                lo = max(0, pi - window)
-                hi = min(len(sig), pi + window + 1)
-                is_locmax = bool(sig[pi] >= sig[lo:hi].max())
-                left, right = sig[lb[i]], sig[rb[i]]
-                r = env.iloc[pi]
-                base = max(left, right)
-                fold = float(sig[pi] / base) if base > 0 else np.nan
-                # v6's left-base ratio, on the SAME floored denominator the detector uses --
-                # unfloored it is reported too, because that column is what shows why the
-                # floor is needed (chpS 010/46 scores 30x on a left_base of 0.006).
-                base_l = max(left, den_frac * med)
-                fold_left_raw = float(sig[pi] / left) if left > 0 else np.nan
-                fold_left = float(sig[pi] / base_l) if base_l > 0 else np.nan
-                over_floor = bool(sig[pi] >= med + floor_s * s)
-                ok_abs = is_locmax and sig[pi] > height and proms[i] >= req
-                ok_fold = bool(fold_bar and is_locmax and np.isfinite(fold)
-                               and fold >= fold_bar and over_floor)
-                ok_fold_left = bool(fold_left_bar and is_locmax and np.isfinite(fold_left)
-                                    and fold_left >= fold_left_bar and over_floor)
-                passed = ok_abs or ok_fold or ok_fold_left
-                rows.append({
-                    'gene': gene, 'experiment_name': exp, 'FOV': fov, 'trench_id': trench,
-                    'lineage_family': fam, 'time_frame': int(r['time_frame']),
-                    'track_id': int(r['track_id']), 'fluor': float(sig[pi]),
-                    'threshold': float(height), 'required_prominence': float(req),
-                    'height_s': float((sig[pi] - med) / s),
-                    'prom_s': float(proms[i] / s),
-                    'prom_min_s': float((sig[pi] - min(left, right)) / s),
-                    'prom_left_s': float((sig[pi] - left) / s),
-                    'prom_ratio': float(proms[i] / req) if req > 0 else np.nan,
-                    'fold': fold, 'fold_bar': fold_bar if fold_bar else np.nan,
-                    'fold_left': fold_left, 'fold_left_unfloored': fold_left_raw,
-                    'fold_left_bar': fold_left_bar if fold_left_bar else np.nan,
-                    'route': ('absolute' if ok_abs else 'fold' if ok_fold
-                              else 'fold_left' if ok_fold_left else ''),
-                    'left_base': float(left), 'right_base': float(right),
-                    'binding_side': 'right' if right > left else
-                                    ('left' if left > right else 'tie'),
-                    'n_frames': int(len(sig)), 'frames_to_end': int(len(sig) - 1 - pi),
-                    'is_local_max': is_locmax,
-                    # Which bar blocked it. With a ratio route active, 'height' alone is
-                    # misleading -- a peak under `height` may still have been rejected on
-                    # fold, so say 'height+fold' when a fold route was live and also failed.
-                    'verdict': ('burst' if passed
-                                else 'not local max' if not is_locmax
-                                else ('height+fold' if (fold_bar or fold_left_bar)
-                                      else 'height') if sig[pi] <= height
-                                else 'prominence'),
-                })
-    cols_empty = ['gene', 'experiment_name', 'FOV', 'trench_id', 'time_frame', 'verdict']
-    if not rows:
-        return pd.DataFrame(columns=cols_empty)
-    out = pd.DataFrame(rows).sort_values('prom_ratio', ascending=False)
-    return out.reset_index(drop=True)
+            par = (g.groupby('track_id')['parent_track_id'].first()
+                   .apply(lambda p: int(p) if pd.notna(p) else None).to_dict())
+            rel = _relatives(par)
+            for r in lab.itertuples():
+                fam = {int(r.track_id)} | rel.get(int(r.track_id), set())
+                lo, hi = r.time_frame - mask_window, r.time_frame + mask_window
+                sel = g[(g.track_id.isin(fam)) & (g.time_frame.between(lo, hi))]
+                for k in map(tuple, sel[FRAME_KEY].values):
+                    mask[idx[k]] = True
+    pool['in_decay_mask'] = mask
+    pool['sample_weight'] = np.where(pool['y'] == 1, 1.0,
+                                     np.where(pool['in_decay_mask'], 0.0, 1.0))
+    pool['cv_group'] = pool[KYMO_KEY].apply(lambda r: '|'.join(r), axis=1)
+
+    if verbose:
+        n_use = int((pool.sample_weight > 0).sum())
+        print(f'training table: {len(pool):,} cell-frames over {len(reviewed)} reviewed '
+              f'trenches ({pool.gene.nunique()} genes, {pool.experiment_name.nunique()} exps)')
+        print(f'  positives {int(pool.y.sum())}  ({100*pool.y.mean():.2f}%)')
+        print(f'  decay-masked (weight 0, mask_window={mask_window}): '
+              f'{int((pool.sample_weight == 0).sum())} extra rows')
+        print(f'  usable in the loss: {n_use:,}  '
+              f'({int(pool.y.sum())} pos / {n_use - int(pool.y.sum())} neg, '
+              f'1:{(n_use - int(pool.y.sum())) / max(1, int(pool.y.sum())):.0f})')
+    return pool
+
+def flags_to_events(d, value_col, flag, link_dt=3, slack=1.5, drift=10.0, L_by=None,
+                    report='peak'):
+    """Collapse flagged cell-frames into events, one row per connected component.
+
+    The tolerance is a SUM, `slack * cell_length + drift * dt`, via
+    `_link_ty_capped` -- never the superseded product `1.5 * L * dt`, which
+    reaches 4.5 cell lengths at dt=3 and was measured merging two cells 109.6 px apart.
+    `L` is the trench's median `axis_major_length` over ALL its cell-frames, not just the
+    flagged ones, so the tolerance does not shrink as the threshold rises.
+
+    Equivalent to `score_to_events` but driven by a boolean rather than a
+    threshold on a `score` column, and with `L` precomputed -- that function re-scans the
+    whole table once per trench, which is too slow inside a threshold sweep.
+
+    `report` selects WHICH cell-frame of a component represents the event: `'peak'` the
+    highest `value_col`, `'onset'` the earliest frame. THE TWO MUST NEVER BE QUOTED AS ONE.
+    The same events reported at the peak instead of the onset once moved an agreement
+    number from 13/156 to 89/156. v1 reports onset (its concurrent merge keeps the EARLIER peak); v2 and
+    v3 report the peak.
+    """
+    cols = KYMO_KEY + ['track_id', 'time_frame', 'gene', value_col]
+    hot = d.loc[flag]
+    if not len(hot):
+        return pd.DataFrame(columns=cols)
+    if L_by is None:
+        L_by = d.groupby(KYMO_KEY)['axis_major_length'].median()
+    out = []
+    for key, g in hot.groupby(KYMO_KEY, sort=False):
+        g = g.sort_values('time_frame')
+        L = float(L_by.get(key, np.nan))
+        if not np.isfinite(L) or L <= 0:
+            L = 1.0
+        comp = _link_ty_capped(g['time_frame'].astype(int).tolist(),
+                               g['centroid_y'].astype(float).tolist(),
+                               slack * L, drift, link_dt)
+        g = g.assign(_c=comp)
+        pick = (g.groupby('_c')[value_col].idxmax() if report == 'peak'
+                else g.groupby('_c')['time_frame'].idxmin())
+        out.append(g.loc[pick, cols])
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=cols)
 
 
-# ---------------------------------------------------------------------------------------
-# Locating an event's cell along the trench
-# ---------------------------------------------------------------------------------------
+def run_v3(clean, fiji, labels, model_out=None, verbose=True):
+    """Freeze the splits, build the features, fit, score, and link v3's events.
 
+    Returns `(events, splits, model_bundle)`. With `model_out` the bundle is also saved
+    there with joblib. Deterministic: the splits are seeded (`SPLIT_SEED`), as are the CV
+    folds and the boosting (`V3_SEED`), so a rebuild reproduces
+    `models/burst_v3_100226.joblib` prediction-for-prediction.
+    """
+    import joblib
+
+    splits = make_splits(trench_index(clean), labels, test_frac=SPLIT_TEST_FRAC,
+                         seed=SPLIT_SEED)
+    dev = set(map(tuple, splits.loc[splits['split'] == 'dev', KYMO_KEY].values))
+    lab_dev = labels[[tuple(r) in dev for r in labels[KYMO_KEY].values]].copy()
+
+    d = clean.merge(fiji[FRAME_KEY + ['fiji_mean']].rename(columns={'fiji_mean': F_FIJI}),
+                    on=FRAME_KEY, how='inner')
+    assert len(d) == len(clean), f'the FIJI join lost rows: {len(clean)} -> {len(d)}'
+    feat = build_features_v3(d, verbose=verbose)
+    FEATS = feat.attrs['feature_cols']
+
+    # out-of-fold scores for every dev cell-frame, then the final model on all of dev
+    tt = build_training_table(feat, lab_dev, reviewed=dev, mask_window=V3_MASK_WINDOW,
+                              verbose=False)
+    oof, auc, ap = cv_score_all(tt, FEATS, seed=V3_SEED, monotone=True)
+    ttr = tt.reset_index(drop=True)
+    fit_idx = np.flatnonzero((ttr['sample_weight'] > 0).to_numpy())
+    model = make_model_v3(seed=V3_SEED, monotone=True, feature_cols=FEATS)
+    model.fit(ttr.loc[fit_idx, FEATS], ttr['y'].to_numpy().astype(int)[fit_idx])
+    bundle = {'model': model, 'feature_cols': list(FEATS), 'blocks': feat.attrs['blocks'],
+              'threshold': V3_THRESHOLD, 'monotone': True,
+              'monotone_signs': {c: MONOTONE_SIGNS[c] for c in FEATS},
+              'mask_window': V3_MASK_WINDOW, 'drift_px': V3_DRIFT,
+              'link_dt': LINK_DT, 'slack_cell_lengths': LINK_SLACK_CELL_LENGTHS,
+              'seed': V3_SEED, 'trained_on': f'dev split of data/{OUTPUTS["splits"]}',
+              'n_labels': int(len(lab_dev))}
+    if model_out is not None:
+        os.makedirs(os.path.dirname(model_out) or '.', exist_ok=True)
+        joblib.dump(bundle, model_out)
+
+    # every cell-frame gets the final model's score; dev cell-frames are then overwritten
+    # with their out-of-fold score, so no trench is scored by a model that saw it
+    feat['score'] = model.predict_proba(feat[FEATS])[:, 1]
+    k_oof = dict(zip(map(tuple, oof[FRAME_KEY].values), oof['score']))
+    feat['score'] = [k_oof.get(k, s) for k, s in
+                     zip(map(tuple, feat[FRAME_KEY].values), feat['score'])]
+
+    L_by = feat.groupby(KYMO_KEY)['axis_major_length'].median()
+    ev = flags_to_events(feat, 'score', feat['score'] >= V3_THRESHOLD, link_dt=LINK_DT,
+                         slack=LINK_SLACK_CELL_LENGTHS, drift=V3_DRIFT, L_by=L_by)
+    geo = [c for c in GEO_COLS if c in clean.columns and c != 'gene']
+    ev = ev.astype({'track_id': int, 'time_frame': int}).merge(
+        clean.astype({'track_id': int, 'time_frame': int})[FRAME_KEY + geo],
+        on=FRAME_KEY, how='left')
+    assert ev['centroid_y'].notna().all(), 'a v3 event has no geometry'
+    ev = add_relative_y(ev, clean).assign(burst_v3=True)
+    if verbose:
+        print(f'v3: {len(ev)} events | dev out-of-fold AUC {auc:.4f} PR-AUC {ap:.4f} | '
+              f'{len(dev)} dev trenches, {len(lab_dev)} dev labels')
+    return ev, splits, bundle
+
+
+# Scoring events against labels
+
+def match_events(events, labels, tol=1, tol_col=None):
+    """Maximum-cardinality one-to-one matching of events to labels, per trench, on time only.
+
+    `tol` is +-frames; with `tol_col` each label carries its own tolerance (for example its
+    `duration`). Returns `(tp, matched_label_index, matched_event_index)` with the input
+    frames' index labels. One-to-one matters: "any label within tol" lets one event claim
+    several labels and inflates precision and recall at once.
+    """
+    from scipy.optimize import linear_sum_assignment
+    lb_by = dict(list(labels.groupby(KYMO_KEY, sort=False)))
+    li, ei = [], []
+    for key, e in events.groupby(KYMO_KEY, sort=False):
+        lab = lb_by.get(key)
+        if lab is None:
+            continue
+        d = np.abs(e['time_frame'].to_numpy(int)[:, None]
+                   - lab['time_frame'].to_numpy(int)[None, :]).astype(float)
+        t = (lab[tol_col].to_numpy(float)[None, :] if tol_col else np.full((1, len(lab)), tol))
+        ok = d <= t
+        if ok.any():
+            cost = np.where(ok, d, float(t.max()) * min(d.shape) + 1.0)   # cardinality first
+            ri, ci = linear_sum_assignment(cost)
+            hit = ok[ri, ci]
+            ei += list(e.index[ri[hit]])
+            li += list(lab.index[ci[hit]])
+    return len(li), li, ei
+
+
+def match_one_to_one(events, labels, tol=1):
+    """The matched count only -- what `test_bursts.py` pins."""
+    return match_events(events, labels, tol=tol)[0]
+
+
+def prf(tp, n_events, n_labels):
+    p = tp / n_events if n_events else np.nan
+    r = tp / n_labels if n_labels else np.nan
+    f = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+    return p, r, f
+
+
+# Event tables: position along the trench, and the viewer union
+
+# helps attach a burst to the nearest cell (based on centroid-y pixel values)
 def add_relative_y(events, cells, track_col='track_id', frame_col='time_frame',
                    y_col='centroid_y'):
-    """Add a scale-free along-trench position to any event table, so its cell is findable.
+    """
 
-    Applied to **every** event table regardless of how the event was decided, because
-    `centroid_y` alone does not identify a cell to a reader: it is raw camera pixels, and a
-    trench occupies a different pixel band in every acquisition.
-
-    Three columns, deliberately overlapping, because they fail differently:
-
-    ==============================  =====================================================
     ``centroid_y_rel``              0 at the OPEN end, 1 at the closed end. Denominator is
                                     this trench's own occupied extent (see below), so it
                                     maps straight onto the viewer's y-axis as a fraction.
@@ -1830,7 +1672,6 @@ def add_relative_y(events, cells, track_col='track_id', frame_col='time_frame',
                                     that frame, sorted by `centroid_y`. Denominator-free,
                                     so it survives a bad extent estimate.
     ``n_cells_in_frame``            how many cells that rank is out of -- "cell 3 of 8".
-    ==============================  =====================================================
 
     **What the denominator is, precisely.** Per kymograph, over all cell-frames:
     `y_lo = min(centroid_y - L/2)` and `y_hi = max(centroid_y + L/2)`, using cell bodies
@@ -1848,8 +1689,7 @@ def add_relative_y(events, cells, track_col='track_id', frame_col='time_frame',
     Args:
         events: any table with the trench key plus a track and a frame column.
         cells: the cell table the events were detected on, for the extent and the ranks.
-        track_col, frame_col, y_col: the event table's names for those three. Sustained rises
-            anchor on `peak_track_id` / `peak_frame` / `peak_centroid_y`.
+        track_col, frame_col, y_col: the event table's names for those three.
 
     Returns a copy of `events` with the three columns added, plus `trench_span_px` so the
     denominator that produced `centroid_y_rel` is auditable rather than implicit.
@@ -1886,143 +1726,14 @@ def add_relative_y(events, cells, track_col='track_id', frame_col='time_frame',
     out['trench_span_px'] = span.round(1)
     return out.drop(columns=['y_lo', 'y_hi'])
 
-
-# ---------------------------------------------------------------------------------------
-# A second event class: sustained rises
-# ---------------------------------------------------------------------------------------
-
-def detect_sustained_rises(df, w=8, z_min=3.0, fluor_col=FLUOR_COL, min_group=0,
-                           return_all=False, verbose=True):
-    """Trenches whose expression steps up to a NEW LEVEL rather than spiking.
-
-    A burst is a peak; prominence is designed to reject a monotone ramp, and correctly so.
-    But some trenches genuinely shift baseline -- `DUMM_giTG066_063_120925 002/1979` rises
-    1.62x across the movie, with its envelope still climbing at the last frame. That is a
-    real observation the burst table cannot represent, so it gets its own table.
-
-    Statistic: ``log2(median(last w frames) / median(first w frames))`` per (trench, lineage
-    family) envelope, robust-z'd **within (gene, experiment)**. The z is the whole point --
-    an absolute fold bar does not work, because constitutive genes drift too: measured, a
-    fold >= 1.5 rule ranks hupA **1st of 10**. Scoring against how much this gene's own
-    trenches normally drift puts hupA and mazF back at 0.00 for every z >= 2.5.
-
-    `peak_over_last` = ``env.max() / median(last w)`` separates a ramp from a burst that
-    happens to end high: at z >= 3.0, 1 of 3 hits is a trench that already bursts, and that
-    column is what identifies it. Filter on it rather than assuming the two classes are
-    disjoint.
-
-    **Read the z, not the fold.** baeS trenches span 0.56x-1.9x (10th-90th percentile of
-    per-trench fold), so trench 1979's 2.62x is only z = 1.42 -- real, but not separable from
-    that gene's ordinary trench-to-trench spread on this dataset. A bar low enough to include
-    it flags ~10% of all trenches.
-
-    Args:
-        w: frames per comparison window. A family needs >= 3*w frames to be judged.
-        z_min: robust-z bar. Only positive rises are returned.
-        min_group: skip (gene, experiment) groups with fewer than this many envelopes, whose
-            MAD is not estimable. 0 keeps everything (what the reported numbers used). Check
-            the returned `group_n` before trusting any single z.
-        return_all: return EVERY scored envelope instead of the hits -- rises and falls
-            alike, no z bar, no one-per-trench collapse. This is the frame to plot the drift
-            distribution from. The hits frame is filtered to `logfold > 0` and to one family
-            per trench, so its spread is not the null distribution and must not be quoted as
-            one.
-
-    Returns:
-        DataFrame. With `return_all=False`, one row per trench (its strongest family), sorted
-        by descending z. With `return_all=True`, one row per (trench, family) envelope.
-    """
-    rows = []
-    for (exp, fov, trench), tr in df.groupby(KYMO_KEY, observed=True):
-        gene = tr['gene'].iloc[0]
-        tr = tr.sort_values('time_frame')
-        fams = lineage_family_roots(tr)
-        tagged = tr.assign(_fam=[fams[int(t)] for t in tr['track_id']])
-        for fam, g in tagged.groupby('_fam'):
-            env = trench_max_envelope(g, fluor_col=fluor_col)
-            sig = env[fluor_col].to_numpy()
-            if len(sig) < 3 * w:
-                continue
-            first, last = np.median(sig[:w]), np.median(sig[-w:])
-            if first <= 0 or last <= 0:
-                continue
-            imax = int(np.argmax(sig))
-            rows.append({
-                'gene': gene, 'experiment_name': exp, 'FOV': fov, 'trench_id': trench,
-                'lineage_family': fam, 'n_frames': int(len(sig)),
-                'first': float(first), 'last': float(last),
-                'fold': float(last / first), 'logfold': float(np.log2(last / first)),
-                'env_max': float(sig[imax]),
-                'peak_frame': int(env['time_frame'].iloc[imax]),
-                'peak_track_id': int(env['track_id'].iloc[imax]),
-                'peak_centroid_y': float(env['centroid_y'].iloc[imax]),
-                'peak_over_last': float(sig[imax] / last),
-            })
-
-    cols_empty = ['gene', 'experiment_name', 'FOV', 'trench_id', 'fold', 'z']
-    if not rows:
-        return pd.DataFrame(columns=cols_empty)
-    d = pd.DataFrame(rows)
-
-    grp = d.groupby(['gene', 'experiment_name'])['logfold']
-    sizes = grp.transform('size')
-
-    def _z(x):
-        m = x.median()
-        return (x - m) / max(1.4826 * (x - m).abs().median(), 1e-6)
-
-    d['z'] = grp.transform(_z)
-    d['group_n'] = sizes
-    if min_group:
-        d = d[d['group_n'] >= min_group]
-    if return_all:
-        return d.sort_values('z', ascending=False).reset_index(drop=True)
-
-    hits = d[(d['z'] >= z_min) & (d['logfold'] > 0)]
-    # One row per trench: the family with the strongest rise.
-    hits = (hits.sort_values('z', ascending=False)
-                .drop_duplicates(KYMO_KEY).reset_index(drop=True))
-    # Anchored on the peak cell, so a rise is locatable in the viewer like a burst is.
-    hits = add_relative_y(hits, df, track_col='peak_track_id', frame_col='peak_frame',
-                          y_col='peak_centroid_y')
-    if verbose:
-        print(f'sustained rises: {len(d)} envelopes with >= {3 * w} frames across '
-              f'{d.groupby(KYMO_KEY).ngroups} trenches -> {len(hits)} at z >= {z_min}')
-    return hits
-
-
-# ---------------------------------------------------------------------------------------
-# Export for the kymograph viewer
-# ---------------------------------------------------------------------------------------
-
 GEO_COLS = ['gene', 'centroid_x', 'centroid_y', 'axis_major_length',
             'axis_minor_length', 'area']
 
-
+# writes out the bursts for V1-V3 into one CSV to be used downstream 
+# time frame is the 0-based index within the trimmed stack (must not be offset by the time_dict start 
+# hmtl viewer uses start only for printed tick labeskl 
 def build_burst_csv(burst_sets, cells, path, raw_csv=None):
-    """One row per burst PEAK across the union of all definitions, one boolean per definition.
-
-    The viewer joins on (experiment_name, FOV, trench_id, track_id, time_frame) and cuts the
-    outline contour from `ctc_masks[time_frame] == track_id`, so those five columns are the
-    load-bearing ones; the geometry columns let the CSV be validated without opening a mask.
-
-    `time_frame` is the 0-based index within the trimmed stack, i.e. the kymograph COLUMN
-    index. It must NOT be offset by the time_dict `start` -- the viewer uses `start` only for
-    the printed tick labels, so adding it would slide every outline sideways. (That offset is
-    also why a frame number read off the viewer does not equal `time_frame` for any trench
-    with a non-zero `start`.)
-
-    Every row also gets `centroid_y_rel`, `cell_index_from_open_end` and `n_cells_in_frame`
-    from `add_relative_y`, so a burst can be tied to a cell without opening a mask.
-
-    Args:
-        burst_sets: {version: bursts DataFrame}. One boolean column per key, so passing only
-            the definitions under comparison keeps the CSV to those columns. The viewer reads
-            whatever `burst_*` columns it finds and defaults the rest to False.
-        cells: the cell table detection ran on, for the geometry join and the position columns.
-        raw_csv: path to the un-annotated export, read only for columns `cells` lacks
-            (`centroid_x`, `axis_minor_length`), for just these few rows.
-    """
+    
     key = KYMO_KEY + ['track_id', 'time_frame']
     frames = []
     for v, b in burst_sets.items():
@@ -2048,24 +1759,7 @@ def build_burst_csv(burst_sets, cells, path, raw_csv=None):
         extra['FOV'] = extra['FOV'].str.zfill(3)
         out = out.merge(extra, on=key, how='left')
 
-    # fluor / threshold / route / baseline_scope from whichever definition detected the
-    # peak. Filled in `burst_sets` order and only where still null, so the FIRST version that
-    # found a peak wins -- fluor and threshold are identical across versions run under the
-    # same baseline, since baselines do not depend on the partition, and any peak an older
-    # definition found cleared the height bar, so every version that sees it agrees the route
-    # is 'absolute'.
-    #
-    # `baseline_scope` is what makes this safe when the sets were run under DIFFERENT
-    # baselines: a row found only by a per-kymograph run carries that trench's local bar in
-    # `threshold`, and the scope column says so instead of leaving the number ambiguous.
-    # Order `burst_sets` with the gene-scoped definitions first so shared rows report the
-    # gene bar.
-    # The v9 extras ride along only when EVERY set has them, which the all() already
-    # guarantees -- so a v9-only export keeps them and a mixed v4-v7 export is unchanged.
-    carry = [c for c in ('fluor', 'threshold', 'route', 'baseline_scope',
-                         'n_cell_frames', 'n_frames', 'peak_fluor', 'peak_time_frame',
-                         'lit_frac', 'seed_first', 'seed_last', 'n_lit_cell_frames',
-                         'lit_first', 'lit_last', 'peak_frac', 'peak_pct')
+    carry = [c for c in ('fluor', 'threshold', 'route', 'baseline_scope')
              if all(c in b.columns for b in burst_sets.values())]
     for i, v in enumerate(burst_sets):
         src = (burst_sets[v][key + carry]
@@ -2102,3 +1796,67 @@ def build_burst_csv(burst_sets, cells, path, raw_csv=None):
         print('by route: '
               + ' | '.join(f'{r}={n}' for r, n in out['route'].value_counts().items()))
     return out
+
+
+# The build
+def _check(got, want, what):
+    assert got == want, f'{what}: expected {want}, got {got}'
+    print(f'  OK  {what}: {got}')
+
+
+def build_all(out_dir='data', models_dir='models', data_root='', verbose=True):
+    """Regenerate every OUTPUT from the frozen INPUTS, asserting the pinned counts.
+
+    Steps, in order: the clean cell table -> the hand labels and the manual layer -> v1 ->
+    v2 -> v3 (splits, features, fit, score) -> the four-layer viewer union.
+    Returns {name: DataFrame}.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    path = lambda k: os.path.join(out_dir, OUTPUTS[k])
+
+    print('--- inputs ---')
+    clean = clean_cells(data_root=data_root)
+    _check(len(clean), EXPECTED['cells'], 'clean cell-frames')
+    _check(clean.groupby(KYMO_KEY).ngroups, EXPECTED['trenches'], 'trenches')
+    fiji = load_fiji(data_root=data_root)
+
+    print('--- manual (hand labels) ---')
+    labels, rejects = load_hand_labels(cells=clean, data_root=data_root, verbose=False)
+    manual = build_manual(clean, labels)
+    _check(len(manual), EXPECTED['manual'], 'resolved labels')
+    _check(len(rejects), EXPECTED['unresolved_labels'], 'unresolvable labels')
+
+    print('--- v1 ---')
+    v1, _ = run_v1(clean, verbose=verbose)
+    _check(len(v1), EXPECTED['v1'], 'v1 events')
+    _check(v1['route'].value_counts().to_dict(), EXPECTED['v1_routes'], 'v1 routes')
+
+    print('--- v2 ---')
+    v2, _ = run_v2(clean, fiji, model_path=os.path.join(data_root, INPUTS['v2_model']),
+                   verbose=verbose)
+    _check(len(v2), EXPECTED['v2'], 'v2 events')
+
+    print('--- v3 ---')
+    v3, splits, _ = run_v3(clean, fiji, labels, verbose=verbose,
+                           model_out=os.path.join(models_dir, OUTPUTS['v3_model']))
+    _check(len(v3), EXPECTED['v3'], 'v3 events')
+    _check(splits['split'].value_counts().to_dict(),
+           {'dev': 167, 'test': 57, 'unreviewable': 19}, 'splits')
+
+    print('--- writing ---')
+    v1.to_csv(path('v1'), index=False)
+    v2.to_csv(path('v2'), index=False)
+    v3.to_csv(path('v3'), index=False)
+    manual.to_csv(path('manual'), index=False)
+    rejects.to_csv(path('unresolved_labels'), index=False)
+    (splits[KYMO_KEY + ['gene', 'split', 'n_labels', 'n_cell_frames']]
+     .sort_values(['gene', 'split'] + KYMO_KEY).to_csv(path('splits'), index=False))
+    # v1 first so shared rows report v1's values in any carried column
+    union = build_burst_csv({'v1': v1, 'v2': v2, 'v3': v3, 'manual': manual}, clean,
+                            path('union'))
+    _check(len(union), EXPECTED['union'], 'union rows')
+    for k in ('v1', 'v2', 'v3', 'manual', 'unresolved_labels', 'splits'):
+        print(f'  wrote {path(k)}')
+    print(f'  wrote {os.path.join(models_dir, OUTPUTS["v3_model"])}')
+    return {'clean': clean, 'labels': labels, 'manual': manual, 'v1': v1, 'v2': v2,
+            'v3': v3, 'splits': splits, 'union': union}

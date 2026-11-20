@@ -39,7 +39,7 @@ from tqdm import tqdm
 
 # Gene/timing metadata lives in one place so the viewer and the analysis notebook
 # cannot drift apart. See mmtrack/experiment_metadata.py.
-from mmtrack.experiment_metadata import STRAIN_EXP_DICT  # noqa: E402
+from mmtrack.experiment_metadata import STRAIN_EXP_DICT, FAILED_KYMOGRAPHS  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +74,10 @@ def build_kymograph_list(combined_dict, time_dict, trackastra_dir):
                 if exp not in time_dict or fov not in time_dict.get(exp, {}):
                     continue
                 for peak in sorted(time_dict[exp][fov]):
+                    # Individually excluded kymographs are never rendered. See
+                    # experiment_metadata.FAILED_KYMOGRAPHS for the reason per entry.
+                    if (exp, fov, peak) in set(FAILED_KYMOGRAPHS):
+                        continue
                     imgs_path = os.path.join(
                         trackastra_dir, f"{exp}_imgs_{fov}_{peak}.npy"
                     )
@@ -246,7 +250,7 @@ def _normalize_to_uint8(arr, vmin=None, vmax=None):
 
 
 # The kymograph layout now lives in mmtrack.fluor_filters, so the per-cell extractor in
-# mmtrack.track_displacement assembles frames exactly the way this renderer does. A second
+# mmtrack.cell_tables assembles frames exactly the way this renderer does. A second
 # copy here is precisely how the two would silently diverge.
 _to_kymograph = to_kymograph
 
@@ -541,7 +545,7 @@ def render_tracks_svg(tracks, graph, img_width, kymo_shape, downscale, color_map
     return "\n".join(lines)
 
 
-def render_labels_svg(tracks, img_width, kymo_shape, downscale, color_map):
+def render_labels_svg(tracks, img_width, kymo_shape, downscale, color_map, font_size=12.0):
     """Return an inline SVG overlay with a track_id text label on EVERY cell-frame.
 
     One label per cell-frame, not one per lineage. Through 090926 this mirrored the napari
@@ -549,7 +553,7 @@ def render_labels_svg(tracks, img_width, kymo_shape, downscale, color_map):
     which is unusable for identifying a cell mid-movie: to learn the id of a cell at frame 80
     you had to trace its polyline back through division connectors to wherever that lineage
     started. Reading a `track_id` straight off the screen is what a human needs in order to
-    hand-record a burst the automated definitions missed (see mmtrack/burst_labels.py), so
+    hand-record a burst the automated definitions missed (the `manual` layer), so
     every cell-frame now carries its own number.
 
     `tracks` is the napari array [track_id, t, y, x] with exactly one row per cell-frame --
@@ -559,10 +563,11 @@ def render_labels_svg(tracks, img_width, kymo_shape, downscale, color_map):
     this layer therefore joins directly to all_data_annotated_082026.csv. That equality is
     the entire point of the layer, so do not "optimise" it to use the raw napari ids.
 
-    Font drops to 8 px from 10: frames are 20 px wide at --downscale 1.0, and a 3-digit id at
-    10 px overruns its own frame into the neighbouring time point. `text-anchor=middle`
-    centres each number on its cell for the same reason. Colour still matches the track and
-    chart colour, and the black paint-order stroke keeps it readable over any layer beneath.
+    Font size is `--label-font-size`, default 12 px. It was 8 px through 100226, which keeps a
+    3-digit id inside its own 20 px frame at --downscale 1.0 but proved too small to read; at
+    12 px adjacent frames' ids can overlap, so drop back to 8 if they collide. `text-anchor=
+    middle` centres each number on its cell. Colour still matches the track and chart colour,
+    and the black paint-order stroke (scaled with the font) keeps it readable over any layer.
     """
     if tracks is None or len(tracks) == 0:
         return ""
@@ -581,8 +586,9 @@ def render_labels_svg(tracks, img_width, kymo_shape, downscale, color_map):
         y = cy * downscale
         color = color_map.get(tid, "#ffff00")
         lines.append(
-            f'<text x="{x:.1f}" y="{y:.1f}" font-size="8" fill="{color}" '
-            f'style="paint-order:stroke;stroke:#000;stroke-width:2px;stroke-linejoin:round;" '
+            f'<text x="{x:.1f}" y="{y:.1f}" font-size="{font_size:g}" fill="{color}" '
+            f'style="paint-order:stroke;stroke:#000;stroke-width:{font_size / 4:g}px;'
+            f'stroke-linejoin:round;" '
             f'text-anchor="middle" dominant-baseline="middle">{int(tid)}</text>'
         )
     lines.append("</svg>")
@@ -593,61 +599,83 @@ def render_labels_svg(tracks, img_width, kymo_shape, downscale, color_map):
 # Burst outlines (from the notebook's burst CSV)
 # ---------------------------------------------------------------------------
 
-# The definitions the viewer draws -- TWO layers, kept to the live decision boundary:
-# v7, the most PRECISE rule available (P 0.838 against the hand labels), and v12, the trained
-# classifier that beats every rule on recall (P 0.607 at R 0.739, out of fold, one-to-one
-# matched at +-1 frame). A rule that is right when it fires beside a model that finds three
-# times as much: yellow-without-magenta is something the rule sees and the model missed,
-# magenta-without-yellow is the recall v12 buys.
+# What the viewer draws: the three DEFINITIONS plus the hand-annotated GROUND TRUTH, all from
+# the union table `07_build_bursts.py` writes (mmtrack.bursts.OUTPUTS['union']).
 #
-# Two, not more: more than three outline layers cannot be read on one kymograph, and every
-# other definition is either nested inside these or superseded. v5 is a STRICT SUBSET of v7,
-# so every v5 outline was already inside a v7 one; v4/v6 are the versions v5/v7 are supersets
-# of; v1-v3 are the frozen regression fixture; v9/v10 are superseded by v11, and v11 by v12.
-# All of them stay in mmtrack.bursts -- this list is only what gets DRAWN. Per-definition
-# detail: bursts.md sections 7 and 14.
+# `manual` is NOT a definition -- nothing detects it; it is the reference the three are
+# judged against: 837 hand-marked bursts over 208 trenches and 7 genes. At the exact frame v1
+# lands on 92 of them and misses 745, v2 lands on 555 and misses 282, v3 lands on 407 and
+# misses 430 (v3 is closer within +-1 frame -- see bursts.md section 7).
 #
-# Every definition stays a COLUMN in the CSV, and all of them stay in mmtrack.bursts as the
-# regression fixture against data/bursts_082026.csv -- this list is only what gets a layer.
+#   v1  the four-route rule: the most PRECISE, at about a quarter of v2's recall
+#   v2  the classifier: the best RECALL
+#   v3  the within-trench monotone classifier: the best per-gene ORDERING
 #
-# ADDING A VERSION TAKES SIX EDITS, NOT ONE. This tuple drives the SVG generation and the
-# `layer-burst<v>` divs, but the checkbox panel, the JS `layers` array and the --burst-csv help
-# text below are all hardcoded. The six places are:
-#   1. this tuple
-#   2. BURST_COLORS just below (a bare dict index in render_bursts_svg -- KeyError if missed)
-#   3. the chk-burst<v> input+label in HTML_TEMPLATE
-#   4. ... and that ctrl-group's OWN closing </div>. The insertion point sits immediately
-#      above the .controls closer, so it is very easy to let the new group swallow it: that
-#      happened when v9 was added, leaving .controls unclosed, which silently killed the
-#      sticky control bar AND horizontal kymograph scrolling (every .gene-panel became a flex
-#      item of .controls). _assert_controls_balanced below now fails the build instead.
-#   5. the `layers` JS array in HTML_TEMPLATE
-#   6. the --burst-csv help string in main()
+# Per-definition detail: bursts.md sections 3, 4 and 5.
 #
-# DO 3 BEFORE 5. The toggle JS calls getElementById with no null guard, so a `layers` entry
-# with no matching checkbox throws TypeError and aborts the whole IIFE -- applyLayers() never
-# runs, so NO layer initialises and the lineage-highlight handlers never register. That is
-# worse than the reverse mistake, which only leaves outlines hidden: measured when v6 was
-# added, 101 `layer-burstv6` divs and 0 `chk-burstv6` checkboxes.
+# The burst outline layers come in SETS, chosen with --burst-layers. A set is an ordered tuple
+# of BurstLayer specs, WIDEST FIRST: the checkboxes, the JS `layers` array, the colours and the
+# widths are all generated from it, so adding a layer is ONE edit here (plus its column in the
+# burst CSV). That replaced a seven-edit recipe whose two traps -- a JS entry with no checkbox
+# aborting the whole IIFE, and a new ctrl-group swallowing the `.controls` closer -- both shipped.
 #
-# After building, grep the HTML: `chk-burstv<n>` should appear exactly twice (the id and the
-# for), `burstv<n>` once inside `const layers`, and `layer-burstv<n>` once per trench that has
-# an event.
+# ORDER IS WIDEST FIRST, and that is load-bearing. Outlines are true mask contours, so two layers
+# that agree on a cell draw the IDENTICAL polygon; only strictly decreasing stroke widths keep an
+# agreement legible as concentric haloes (cyan alone = a real burst every definition missed).
+# FOUR layers is the ceiling: the narrowest stroke is already 1.0 px.
 #
-# load_burst_csv defaults any burst_* column the CSV lacks to False, so a viewer built with
-# this list against an older CSV renders an empty layer rather than raising.
+#   v1v2v3manual (default)  manual 100226 / v1 rule / v2 classifier / v3 monotone model
 #
-# ORDER IS MOST-NUMEROUS FIRST, and it is load-bearing: the outlines are true mask contours,
-# so two definitions that agree on a cell draw the SAME path and only the topmost is visible.
-# v12 (1,091 events) is emitted last so it wins the z-order over v7 (164). Reversed, v7 would
-# vanish underneath v12 wherever the two agree -- which is most of the time. Do not reorder.
-BURST_VERSIONS = ("v7", "v12")
+# load_burst_csv defaults any burst_* column the CSV lacks to False, so a set built against an
+# older CSV renders an empty layer rather than raising (but ALL layers empty is an error).
+from collections import namedtuple
 
-# One stroke colour per definition, so they can be overlaid and told apart. These two hexes
-# are the ones the 091026 build shipped; keep them, so a screenshot from either build reads
-# the same way.
-BURST_COLORS = {"v7":  "rgb(255,235,0)",     # yellow   the precise RULE
-                "v12": "rgb(255,0,200)"}     # magenta  the trained CLASSIFIER
+BurstLayer = namedtuple("BurstLayer", "version color hex width checked label title")
+
+BURST_LAYER_SETS = {
+  "v1v2v3manual": (
+    BurstLayer('manual', 'rgb(0,229,255)', '#00e5ff', 5.0, True,
+               'Burst manual (hand-annotated)',
+               'HAND-ANNOTATED BURSTS -- the GROUND TRUTH, not a definition. 837 bursts marked by\neye on this viewer, over 208 trenches and 7 genes (baeS 282, gfcE 129, chpS 100, alkA 93,\naraB 89, gldA 74, lacZ 70). Nothing detects these; they are the reference the three definitions\nare judged against, and they are drawn WIDEST so the others nest inside them.\nHOW TO READ IT: cyan halo ALONE = a real burst BOTH definitions missed. cyan+magenta = v2\ncaught it, v1 missed it. cyan+yellow+magenta = both caught it. magenta with NO cyan = v2 fired\nwhere nothing was annotated. Measured at the exact frame, v1 lands on 92 of the 837 and misses\n745; v2 lands on 555 and misses 282; v3 lands on 407 and misses 430.\nSource data/annotated_bursts_100226.csv -> data/bursts_manual_100226.csv; 19 rows did not\nresolve to a cell-frame and are in data/burst_labels_recheck_100226.csv for re-checking.\nbursts.md section 6.'),
+    BurstLayer('v1', 'rgb(255,235,0)', '#ffeb00', 3.5, False,
+               'Burst v1 (rule)',
+               "BURST v1 -- THE RULE, and the most PRECISE definition available:\nP 0.838 against the hand labels, at about a quarter of v2's recall. Closed-form, so when it\nfires you can say exactly why: four OR'd routes, and the `route` column says which. 158\nevents = absolute 97 (height bar + MAD prominence) + fold_left 36 + fold 18 + tukey 7 (the\nper-trench fence Q3 + 4.0*IQR).\nCAVEAT: v1 does NOT pass the constitutive control perfectly -- one hupA event, at 012/1165\nframe 81, bright (7.73 against a 6.17 bar) but NOT prominent, which is exactly the failure a\nmarginal distribution cannot see. Check a yellow-only outline by eye before trusting it.\nbursts.md section 3."),
+    BurstLayer('v2', 'rgb(255,0,200)', '#ff00c8', 2.25, False,
+               'Burst v2 (classifier)',
+               'BURST v2 -- THE TRAINED CLASSIFIER, at its shipped 0.75 threshold.\n1,041 events. Out of fold, one-to-one matched at +-1 frame: P 0.607 / R 0.739 against v1\'s\n0.838 / 0.281 -- it beats every rule on recall and is beaten by v1 on precision. It has NO\nclosed-form definition and no threshold to quote; the honest gloss from local-occlusion\nranking is "brightest in its frame, top few percent of its trench, raised above its own\nrecent past", all within-trench.\nIt was trained on lacZ and gfcE only. Its mazF/hupA events (57/25) are unvalidated:\nthose genes were never hand-reviewed, so nothing is known about them in either direction.\nbursts.md section 4.'),
+    BurstLayer('v3', 'rgb(0,230,118)', '#00e676', 1.0, False,
+               'Burst v3 (within-trench)',
+               'BURST v3 -- THE WITHIN-TRENCH MONOTONE CLASSIFIER, at threshold 0.90.\n1,065 events. Every feature is computed inside a single kymograph and every one of the 26\nconstrained features has a physically-defensible sign (brighter, risen, fallen, brightest in\nframe => more burst-like). Held out: P 0.560 / R 0.700 / F1 0.622 on 57 trenches never\ntrained on, against dev 0.628 -- it generalises.\nIt does NOT beat v2 on F1 (0.719 on the same holdout). What it does beat it on is the per-gene\nORDERING: Spearman against the hand labels is 0.714 for v3, 0.607 for v2 and -0.393 for v1.\nNo closed form -- a depth-3 surrogate reaches only 0.405, so do not quote a threshold.\nbursts.md section 5.'),
+  ),
+}
+DEFAULT_BURST_LAYERS = "v1v2v3manual"
+
+
+def _layer_globals(name):
+    layers = BURST_LAYER_SETS[name]
+    ws = [l.width for l in layers]
+    assert all(a > b for a, b in zip(ws, ws[1:])), f"{name}: widths must strictly decrease"
+    assert len(layers) <= 4, f"{name}: four layers is the ceiling"
+    return (tuple(l.version for l in layers), {l.version: l.color for l in layers},
+            {l.version: l.width for l in layers})
+
+
+# Module globals are the ACTIVE set (default until generate_viewer rebinds them); every renderer
+# reads these, and render_bursts_svg indexes them bare so a missing entry is a loud KeyError.
+BURST_VERSIONS, BURST_COLORS, BURST_WIDTHS = _layer_globals(DEFAULT_BURST_LAYERS)
+
+
+def burst_controls_html(name):
+    return "".join(
+        f'  <div class="ctrl-group">\n    <input type="checkbox" id="chk-burst{l.version}"'
+        f'{" checked" if l.checked else ""}>\n'
+        f'    <label for="chk-burst{l.version}" style="color:{l.hex};"\n'
+        f'      title="{l.title}">{l.label}</label>\n  </div>\n'
+        for l in BURST_LAYER_SETS[name])
+
+
+def burst_layers_js(name):
+    return ",".join(f"'burst{l.version}'" for l in BURST_LAYER_SETS[name])
 
 
 
@@ -657,7 +685,7 @@ def load_burst_csv(path):
 
     dtypes are forced because a bare read_csv turns FOV '015' into 15 and trench_id '1488'
     into 1488, which then match no card -- the same trap documented in
-    mmtrack/track_displacement.py:load_cell_data.
+    mmtrack/cell_tables.py:load_cell_data.
     """
     if not path:
         return {}
@@ -665,6 +693,9 @@ def load_burst_csv(path):
         path, dtype={"experiment_name": str, "FOV": str, "trench_id": str, "gene": str}
     )
     df["FOV"] = df["FOV"].str.zfill(3)
+    # Recorded BEFORE the default-fill below, or the error message at the end of this function
+    # reports the columns it just invented as though the table had carried them.
+    burst_cols_on_disk = sorted(c for c in df.columns if c.startswith("burst_"))
     for v in BURST_VERSIONS:
         col = f"burst_{v}"
         if col not in df.columns:
@@ -679,6 +710,16 @@ def load_burst_csv(path):
     n = {v: int(df[f"burst_{v}"].sum()) for v in BURST_VERSIONS}
     print(f"  burst CSV: {len(df)} rows over {len(by_trench)} trenches | " +
           " | ".join(f"{v}={n[v]}" for v in BURST_VERSIONS))
+    # A single empty layer is legitimate -- an older table simply lacks that column, and the
+    # default-to-False above is there on purpose. But EVERY layer empty on a non-empty table is
+    # never intentional: it means the columns are spelled for a different generation, and the
+    # build would otherwise emit a complete, fully-interactive ~170 MB viewer with no outlines
+    # at all, announcing it only as "v1=0 | v2=0" in the middle of a long log.
+    if len(df) and not any(n.values()):
+        raise SystemExit(
+            f"\n{path}: none of {list(BURST_VERSIONS)} matched a column. The table carries "
+            f"{burst_cols_on_disk}.\nThis table predates the current definitions; "
+            f"regenerate it with `python 07_build_bursts.py`.")
     return by_trench
 
 
@@ -712,6 +753,9 @@ def render_bursts_svg(bursts, ctc_masks, img_width, kymo_shape, downscale, versi
 
     h, w = kymo_shape
     color = BURST_COLORS[version]
+    # Bare dict index on purpose: a version added to BURST_VERSIONS without a width is a
+    # loud KeyError here, not a silent layer that is invisible wherever it agrees.
+    width = BURST_WIDTHS[version]
     n_frames = ctc_masks.shape[0]
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{int(w * downscale)}" '
@@ -736,7 +780,7 @@ def render_bursts_svg(bursts, ctc_masks, img_width, kymo_shape, downscale, versi
             )
             parts.append(
                 f'<polygon points="{pts}" fill="none" stroke="{color}" '
-                f'stroke-width="1.5" stroke-opacity="0.95"/>'
+                f'stroke-width="{width}" stroke-opacity="0.95"/>'
             )
             drew = True
         if not drew:
@@ -867,7 +911,7 @@ def _assert_controls_balanced(html):
     bal = seg.count('<div') - seg.count('</div>')
     assert bal == 0, (
         f'.controls block is unbalanced by {bal:+d} <div> before the first .gene-panel. '
-        'A ctrl-group is probably missing its closing </div> (see the FIVE EDITS comment). '
+        'A ctrl-group is probably missing its closing </div> (see the BURST_LAYER_SETS comment). '
         'Left unfixed this silently disables the sticky control bar and kymograph scrolling.')
 
 
@@ -1020,7 +1064,7 @@ pixels on a dim trench and 0.0% on bright ones. Lossless PNG, unlike every other
 Displayed over [0.25 x max, max] of this trench's RAW stack pooled over every frame --
 FIJI's "minimum at 25% of the max", rounded half-up as you would type it, and NOT a
 25th-percentile clip, which is 0 on this background-subtracted data. DISPLAY ONLY -- the fluor_filtered column in the CSVs and burst definitions
-v4-v7 all still use the 3x3 median.">Fluorescence (FIJI median r2)</label>
+every burst definition still detects on the unfiltered column.">Fluorescence (FIJI median r2)</label>
   </div>
   <div class="ctrl-group">
     <input type="checkbox" id="chk-fluornorm">
@@ -1043,40 +1087,14 @@ style="color:#35b779;">&#9608;</span><span style="color:#fde725;">&#9608;</span>
     <input type="checkbox" id="chk-labels">
     <label for="chk-labels">Labels</label>
   </div>
-  <div class="ctrl-group">
-    <input type="checkbox" id="chk-burstv7">
-    <label for="chk-burstv7" style="color:#ffeb00;"
-      title="BURST v7 -- the most PRECISE definition available: P 0.838 against the hand
-labels, at about a quarter of v12's recall. A closed-form rule, so when it fires you can say
-exactly why: it is v6 (height bar + MAD prominence + two fold routes) plus a fourth route,
-the per-trench Tukey fence Q3 + 4.0*IQR. 164 events.
-CAVEAT: v7 is the first definition that does NOT pass the constitutive control cleanly --
-one hupA event, at 012/1165 frame 81, bright (7.73 against a 6.17 bar) but NOT prominent,
-which is exactly the failure a marginal distribution cannot see. Check a yellow-only outline
-by eye before trusting it. bursts.md section 7.">Burst v7 (rule)</label>
-  </div>
-  <div class="ctrl-group">
-    <input type="checkbox" id="chk-burstv12">
-    <label for="chk-burstv12" style="color:#ff00c8;"
-      title="BURST v12 -- the TRAINED CLASSIFIER, at its shipped 0.75 threshold. 1,091
-events. Out of fold, one-to-one matched at +-1 frame: P 0.607 / R 0.739, against v11's
-0.592 / 0.429 -- it dominates every rule on recall. It has NO closed-form definition and no
-threshold to quote; the honest gloss from local-occlusion ranking is "brightest in its frame,
-top few percent of its trench, raised above its own recent past", all within-trench.
-TWO KNOWN FAILURES, reported not hidden: it fires 2 events in the certified burst-free trench
-at 0.75 (0 at 0.90), and it is far worse than the rules on the constitutive controls --
-hupA 25 / mazF 57 / chpS 94 against v11's 0 / 9 / 34 -- because it has NEVER SEEN a control
-gene. Labelling a few hupA/mazF/chpS trenches is the single highest-return fix.
-bursts.md section 14.">Burst v12 (classifier)</label>
-  </div>
-</div>
+{burst_controls}</div>
 {gene_panels}
 <script>
 (function() {{
   const tabs = document.querySelectorAll('#gene-tabs button');
   const panels = document.querySelectorAll('.gene-panel');
   const layers = ['phase','fluor','fluorfilt','fluornorm','mask','tracks','labels',
-                  'burstv7','burstv12'];
+                  {burst_layers_js}];
 
   function switchTab(gene) {{
     tabs.forEach(t => t.classList.toggle('active', t.dataset.gene === gene));
@@ -1136,6 +1154,10 @@ def generate_viewer(args):
     # Relative --time-dict paths resolve against the repo, not the caller's cwd, so the
     # documented command works from anywhere.
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    global BURST_VERSIONS, BURST_COLORS, BURST_WIDTHS
+    layer_set = getattr(args, "burst_layers", DEFAULT_BURST_LAYERS)
+    BURST_VERSIONS, BURST_COLORS, BURST_WIDTHS = _layer_globals(layer_set)
+    print(f"  burst layers: {layer_set} {BURST_VERSIONS}")
     burst_csv_path = getattr(args, "burst_csv", None)
     if burst_csv_path and not os.path.isabs(burst_csv_path):
         burst_csv_path = os.path.join(script_dir, burst_csv_path)
@@ -1249,7 +1271,8 @@ def generate_viewer(args):
                 )
             mask_b64 = render_mask(ctc_masks, args.downscale)
             tracks_svg = render_tracks_svg(tracks, graph, imgs.shape[2], kymo_shape, args.downscale, color_map)
-            labels_svg = render_labels_svg(tracks, imgs.shape[2], kymo_shape, args.downscale, color_map)
+            labels_svg = render_labels_svg(tracks, imgs.shape[2], kymo_shape, args.downscale, color_map,
+                                           font_size=args.label_font_size)
 
             # Burst outlines: one layer per definition so two can be overlaid to see
             # where they disagree. Keyed on (exp, fov, peak) exactly as the card is.
@@ -1363,6 +1386,8 @@ def generate_viewer(args):
               f"ctc_masks[time_frame] and were not outlined")
 
     html = HTML_TEMPLATE.format(
+        burst_controls=burst_controls_html(layer_set),
+        burst_layers_js=burst_layers_js(layer_set),
         n_kymos=total_rendered,
         n_genes=len(genes),
         gene_tabs=gene_tabs_html,
@@ -1408,6 +1433,14 @@ def main():
         type=float,
         default=1.0,
         help="Downscale factor for images (0.5 = half size, 1.0 = full)",
+    )
+    parser.add_argument(
+        "--label-font-size",
+        type=float,
+        default=12.0,
+        help="Font size (px) of the track_id on every cell-frame in the Labels layer. "
+             "Default 12; 8 (the size through 100226) is the largest that keeps a 3-digit "
+             "id inside one 20 px frame, so use it if adjacent ids collide.",
     )
     parser.add_argument(
         "--jpeg-quality",
@@ -1499,14 +1532,27 @@ def main():
     )
     parser.add_argument(
         "--burst-csv",
-        default=None,
-        help="Burst table from the analysis notebook (data/bursts_viewer_v12_091026.csv). "
-             "When given, adds one toggleable outline layer per definition in "
-             "BURST_VERSIONS -- v7 (the precise rule) and v12 (the trained classifier), one "
-             "outline per EVENT -- drawn as a contour cut from ctc_masks around each bursting "
-             "cell and captioned '<track_id> y<centroid_y_rel>'. Columns the CSV lacks "
-             "default to False, so an older table renders an empty layer rather than "
-             "raising, and extra burst_* columns it carries are simply ignored.",
+        default="data/bursts_viewer_v1v2v3manual_100226.csv",
+        help="Burst table (default data/bursts_viewer_v1v2v3manual_100226.csv). Adds one "
+             "toggleable outline layer per entry of the --burst-layers set; the default set is `manual` (the 837 "
+             "hand-annotated bursts, cyan, widest), `v1` (the precise rule, 158 events, "
+             "yellow), `v2` (the trained classifier, 1,041, magenta) and `v3` (the "
+             "within-trench monotone model, 1,065, green) -- one outline per "
+             "EVENT, drawn as a contour cut from ctc_masks around each bursting cell and "
+             "captioned '<track_id> y<centroid_y_rel>'. Widths are NESTED so agreements are "
+             "legible: a cyan halo with nothing inside it is a real burst both definitions "
+             "missed. A column the CSV lacks defaults to False, so an older table renders an "
+             "empty layer rather than raising, and extra burst_* columns are ignored; but if "
+             "EVERY layer comes back empty the build fails, since that only ever means the "
+             "table predates this generation.",
+    )
+    parser.add_argument(
+        "--burst-layers",
+        choices=sorted(BURST_LAYER_SETS),
+        default=DEFAULT_BURST_LAYERS,
+        help="Which set of outline layers to draw (BURST_LAYER_SETS). 'v1v2v3manual' "
+             "(default): the 100226 hand labels, v1, v2, v3 -- pair with the default "
+             "--burst-csv.",
     )
     parser.add_argument(
         "--genes",

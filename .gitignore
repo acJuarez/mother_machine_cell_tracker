@@ -11,3 +11,6 @@ __pycache__/
 *.html
 figures/
 data/
+
+# Local-only data inventory (data/ itself is ignored, so this map is not committed)
+/DATA.md

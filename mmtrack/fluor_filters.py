@@ -132,7 +132,7 @@ def remove_speckle(img, min_size, thr=None, connectivity=1):
     component of 528,491 px, of which only 0.43% is ever removable.
 
     connectivity=1 matches the project's labeling convention
-    (mmtrack/cell_segmentation.py:100,104,144).
+    (the mm3 segmentation chain in mmtrack/mm_cell_segmentation.py).
 
     `min_size` is an absolute pixel count, and at a display-minimum threshold that is
     safe: visible components are bright cell cores (median 22-53 px even on the ~1/3
@@ -243,7 +243,7 @@ def _otsu_background_subtract(stack, size, otsu_scale):
 
     A single threshold is computed over the whole (median-smoothed) stack so the
     background level is consistent across time (no per-frame flicker). Mirrors the
-    scaled-Otsu pattern in mmtrack/cell_segmentation.py.
+    scaled-Otsu pattern used by the segmentation stage.
     """
     import warnings
 

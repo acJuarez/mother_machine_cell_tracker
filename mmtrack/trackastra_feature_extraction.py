@@ -1,12 +1,12 @@
 """
-Feature extraction doing bulk of the work for 06_trackastra_feature_extraction.py
+Feature extraction doing bulk of the work for 05_feature_extraction.py
 
 Extracts per-cell morphological/intensity features from CTC-format tracked masks,
 assigns hierarchical lineage IDs, generates kymograph TIFFs, and saves a
 per-experiment DataFrame compatible with the existing plot_cells.py functions. Uses regionprops
 like previous iteration of pipeline used to extract cell features 
 
-Expected trackastra output files (produced by run_trackastra_sherlock.py):
+Expected trackastra output files (produced by 04_trackastra_tracking.py):
     {exp}_ctc_masks_{fov}_{peak}.npy          -- (T, Y, X) tracked label masks
     {exp}_imgs_{fov}_{peak}.npy               -- (T, Y, X) trimmed phase stack
     {exp}_ctc_tracks_{fov}_{peak}.csv         -- CTC track table: label, t1, t2, parent

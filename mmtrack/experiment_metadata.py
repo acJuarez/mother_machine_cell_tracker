@@ -61,9 +61,6 @@ STRAIN_EXP_DICT = {
         "DUMM_giTG060_064_121425": ["000", "005"],
         "DUMM_mazF_murQ_121625": ["005", "006", "012"],
     },
-    "murQ": {
-        "DUMM_mazF_murQ_121625": ["016", "017", "018"],
-    },
 }
 
 # time interval (min)
@@ -134,6 +131,12 @@ FAILED_KYMOGRAPHS = (
     ("DUMM_CL008_080825", "002", "1355"),
     # need to finish segmenting for more data 
     ("DUMM_giTG064_Glucose_022625", "001", "2501"),
+    # missing fluorescence data -- 001/114 is already absent from every table (cells, fiji,
+    # all_data; it survives only in time_dict_082026.json), and an entry that matches no
+    # trench makes drop_excluded_kymographs raise, so it is recorded here but not listed.
+    # ("DUMM_giTG064_Glucose_022625", "001", "114"),
+
+
 )
 
 
