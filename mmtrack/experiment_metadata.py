@@ -1,20 +1,10 @@
-"""Experiment-level metadata: gene mapping, frame interval, and exposure times.
-
-Single source of truth for per-experiment annotations. These dicts previously lived in
-both ``notebooks/trackastra_figures.ipynb`` and ``generate_kymograph_viewer.py``; the two
-copies drifted, and the stale copy silently dropped whole experiments from the analysis
-table (rows got ``gene = None`` and were removed by a later ``dropna``). Import from here
-instead of redefining.
-
-The strain mapping was also once split across ``STRAIN_EXP_DICT_1``/``_2``/``_3``, merged at
-call time by a ``build_combined_dict()`` helper; both are gone. There is one
-``STRAIN_EXP_DICT`` and new experiments go straight into it.
-
-Keys are experiment folder names as they appear on disk and in ``time_dict_*.json``.
-Entries ending in ``_v2`` refer to superseded acquisitions that have since been
-reprocessed under new peak IDs; they are retained for provenance and match no current
-data.
-"""
+# this file serves as general experiment meta data including:
+# strain_exp_dict that maps imaging experiments to the FOVS we use 
+# as well as the strain associated with that strain 
+# Minutes interval is a dict that keeps track of which experiment uses 10 or 5 minute image intervals
+# Exposure_MS is a dict that tracks [phase, yfp] exposure rates in ms
+# as well as a list of failed experiments. Right now lacZ induced with lactose is included to just 
+# ommit it in the basal conditions other strains were tested in
 
 # Gene -> experiment -> list of zero-padded FOV ids.  Add new experiments here.
 STRAIN_EXP_DICT = {
@@ -133,22 +123,20 @@ EXPOSURE_MS = {
     "DUMM_giTG068_059__lactose_062025": [90, 150],
 }
 
-# Acquisitions considered failed. They are present in every data file -- dropped nowhere at
-# source -- and tagged by the `is_failed_experiment` column in the annotated exports, so an
-# analysis opts out with `df[~df.is_failed_experiment]` rather than by re-typing this tuple.
-#
-# Cost of excluding them, measured on the 082026 export: 1,220 of 12,696 unique cells (9.6%)
-# and 37 of 292 trenches, touching 5 genes -- chpS -37%, gfcE -20%, alkA -18%, hupA -18%,
-# lacZ -7%. araB, baeS, gldA, mazF and murQ are untouched, and all 10 genes and all 4 exposure
-# settings survive.
 FAILED_EXPERIMENTS = (
     "DUMM_alkA_chpS_111325",             # alkA (9 trenches) + chpS (15)
     "DUMM_baeS_gfcE_112025",             # gfcE (7) only -- no baeS data despite the name
     "DUMM_giTG068_059__lactose_062025",  # lacZ (4) + hupA (1)
 )
 
+FAILED_KYMOGRAPHS = (
+    # duplicate trench 
+    ("DUMM_CL008_080825", "002", "1355"),
+    # need to finish segmenting for more data 
+    ("DUMM_giTG064_Glucose_022625", "001", "2501"),
+)
+
 
 def exposure_for(experiment_name):
-    """Return (phase_ms, fluor_ms) for an experiment, or (None, None) if unknown."""
     phase, fluor = EXPOSURE_MS.get(experiment_name, (None, None))
     return phase, fluor
